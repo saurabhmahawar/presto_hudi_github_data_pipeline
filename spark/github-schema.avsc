@@ -1,0 +1,103 @@
+{
+  "type": "record",
+  "name": "github_events",
+  "namespace": "hudi",
+  "fields": [
+    {"name": "id", "type": ["null", "string"], "default": null},
+    {"name": "type", "type": ["null", "string"], "default": null},
+    {"name": "public", "type": ["null", "boolean"], "default": null},
+    {"name": "created_at", "type": ["null", "string"], "default": null},
+    {
+      "name": "actor",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "actor_record",
+          "fields": [
+            {"name": "id", "type": ["null", "long"], "default": null},
+            {"name": "login", "type": ["null", "string"], "default": null},
+            {"name": "avatar_url", "type": ["null", "string"], "default": null}
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "repo",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "repo_record",
+          "fields": [
+            {"name": "id", "type": ["null", "long"], "default": null},
+            {"name": "name", "type": ["null", "string"], "default": null}
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "org",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "org_record",
+          "fields": [
+            {"name": "id", "type": ["null", "long"], "default": null},
+            {"name": "login", "type": ["null", "string"], "default": null}
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "payload",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "payload_record",
+          "fields": [
+            {"name": "action", "type": ["null", "string"], "default": null},
+            {
+              "name": "pull_request",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "pr_record",
+                  "fields": [
+                    {"name": "id", "type": ["null", "long"], "default": null},
+                    {"name": "title", "type": ["null", "string"], "default": null},
+                    {"name": "state", "type": ["null", "string"], "default": null}
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "issue",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "issue_record",
+                  "fields": [
+                    {"name": "id", "type": ["null", "long"], "default": null},
+                    {"name": "title", "type": ["null", "string"], "default": null},
+                    {"name": "state", "type": ["null", "string"], "default": null}
+                  ]
+                }
+              ],
+              "default": null
+            }
+          ]
+        }
+      ],
+      "default": null
+    }
+  ]
+}

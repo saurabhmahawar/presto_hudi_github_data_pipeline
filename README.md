@@ -63,34 +63,13 @@ Everything else below is verified against the running stack.
 
 ## How the pipeline works
 
-```
-GitHub Archive (data.gharchive.org)
-        │  24 hourly .json.gz files, offset 3h behind UTC now
-        ▼
-[ airflow ]  task 1: download_and_upload_raw_data      (boto3)
-        │
-        ▼
-[ minio ]    s3://github-raw-data/github-raw/*.json.gz     ← raw staging
-        │
-        ▼
-[ airflow ]  task 2: trigger_hudi_ingestion
-        │      └─ docker exec → [ spark-client ] spark-submit HoodieStreamer
-        │                              reads  s3a://…/github-raw/
-        │                              writes s3a://…/hudi-tables/github_events/
-        │                              syncs  → [ hive-metastore ] (HMS mode)
-        ▼
-[ minio ]    s3://github-raw-data/hudi-tables/github_events/   ← Hudi COW table
-        │                                     .hoodie/         ← commit timeline
-        │                                     type=PushEvent/  ← Hive-style partitions
-        ▼
-[ airflow ]  task 3: run_data_quality_assertions        (PyHive → Presto)
-        │      5 SQL gates scoped to the newest commit instant
-        ▼
-[ presto ]   hudi.default.github_events      ← queryable  →  [ superset ]
-```
+<p align="center">
+  <img src="docs/pipeline_flow.png" alt="Pipeline Flow Diagram" width="85%" />
+</p>
 
 Task dependency is strictly linear: `download → ingest → quality gate`. A failure at any step
 stops the run and triggers the Slack callback.
+
 
 ---
 

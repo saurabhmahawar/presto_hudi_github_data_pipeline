@@ -71,26 +71,9 @@ Task dependency is strictly linear: `download → ingest → quality gate`. A fa
 stops the run and triggers the Slack callback.
 
 
----
-
-## Service endpoints and credentials
-
-| Service | URL | Credentials | Notes |
-| :--- | :--- | :--- | :--- |
-| **MinIO Console** | http://localhost:9001 | `minioadmin` / `minioadmin` | Browse buckets, inspect Hudi files and the `.hoodie` timeline. |
-| **MinIO S3 API** | http://localhost:9000 | same (as access key / secret) | Health probe: `/minio/health/live`. |
-| **Airflow** | http://localhost:8085 | `admin` / `admin` | Container listens on 8080; published as 8085. |
-| **Presto Coordinator** | http://localhost:8080 | *none — no auth configured* | Cluster overview and query history. |
-| **Superset** | http://localhost:8088 | `admin` / `admin` | Health probe: `/health`. |
-| **Spark History Server** | http://localhost:18080 | *none* | Completed Spark applications and their stages. |
-| **Spark Driver UI** | http://localhost:4040 | *none* | Only live **while** a Spark job is running. |
-| **Hive Metastore** | `thrift://localhost:9083` | *none* | Thrift binary protocol; not a browser endpoint. Only published for host-side debugging — all in-stack clients use `thrift://hive-metastore:9083`. |
-| **MySQL** | *not published* | `hive` / `hivepassword` | Reachable only on the internal Docker network. |
-
-> **Presto has no authentication.** `presto-cli` does not require a username, and no user has
-> elevated rights. Do not expose port 8080 beyond localhost.
 
 ---
+
 
 ## Repository layout
 

@@ -32,7 +32,6 @@ Everything else below is verified against the running stack.
 
 - [Technology stack](#technology-stack)
 - [How the pipeline works](#how-the-pipeline-works)
-- [Service endpoints and credentials](#service-endpoints-and-credentials)
 - [Repository layout](#repository-layout)
 - [File-by-file reference](#file-by-file-reference)
 - [Service-by-service reference](#service-by-service-reference)
@@ -70,10 +69,7 @@ Everything else below is verified against the running stack.
 Task dependency is strictly linear: `download → ingest → quality gate`. A failure at any step
 stops the run and triggers the Slack callback.
 
-
-
 ---
-
 
 ## Repository layout
 

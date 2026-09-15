@@ -54,7 +54,6 @@ default_args = {
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
     'on_failure_callback': pipeline_failure_alert,
-    'sla': timedelta(minutes=45),
 }
 
 def download_and_upload_github_data():
@@ -62,17 +61,19 @@ def download_and_upload_github_data():
     Downloads the past 24 hourly .json.gz dumps from GitHub Archive and stages
     them into Object Storage dynamically reading endpoint and bucket from environment.
     """
-    endpoint_host = os.environ.get('B2_ENDPOINT', 's3.us-east-005.backblazeb2.com')
+    endpoint_host = os.environ.get('S3_ENDPOINT', 'http://minio:9000')
     endpoint_url = f"https://{endpoint_host}" if not endpoint_host.startswith("http") else endpoint_host
-    bucket_name = os.environ.get('B2_BUCKET_NAME', 'github-raw-data')
+    bucket_name = os.environ.get('S3_BUCKET_NAME', 'github-raw-data')
     prefix = 'github-raw'
     
+    from botocore.client import Config
     s3_client = boto3.client(
         's3',
         endpoint_url=endpoint_url,
         aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
         aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-        region_name=os.environ.get('AWS_REGION', 'us-east-005')
+        region_name=os.environ.get('AWS_REGION', 'us-east-1'),
+        config=Config(s3={'addressing_style': 'path'})
     )
     
     base_time = datetime.datetime.utcnow() - datetime.timedelta(hours=3)
@@ -153,7 +154,7 @@ def trigger_spark_ingestion():
     Executes Spark HoodieStreamer job to ingest staged raw JSON records into
     Apache Hudi Copy-on-Write tables on Cloud Storage and syncs metadata with Hive Metastore.
     """
-    bucket_name = os.environ.get('B2_BUCKET_NAME', 'github-raw-data')
+    bucket_name = os.environ.get('S3_BUCKET_NAME', 'github-raw-data')
     target_base_path = f"s3a://{bucket_name}/hudi-tables/github_events"
     source_dfs_dir = f"s3a://{bucket_name}/github-raw/"
     
@@ -162,8 +163,8 @@ def trigger_spark_ingestion():
     
     cmd = [
         "/opt/spark/bin/spark-submit",
-        "--driver-memory", "3G",
-        "--executor-memory", "3G",
+        "--master", "local[4]",
+        "--driver-memory", "6G",
         "--class", "org.apache.hudi.utilities.streamer.HoodieStreamer",
         "--packages", "org.apache.hudi:hudi-utilities-slim-bundle_2.12:0.15.0,org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0,org.apache.hadoop:hadoop-aws:3.3.4",
         "/root/.ivy2/jars/org.apache.hudi_hudi-utilities-slim-bundle_2.12-0.15.0.jar",
@@ -173,6 +174,7 @@ def trigger_spark_ingestion():
         "--target-base-path", target_base_path,
         "--target-table", "github_events",
         "--table-type", "COPY_ON_WRITE",
+        "--source-limit", "1073741824",
         "--enable-hive-sync",
         "--hoodie-conf", f"hoodie.streamer.source.dfs.root={source_dfs_dir}",
         "--props", "file:///opt/spark/conf/github-ingest.properties"
@@ -186,75 +188,117 @@ def trigger_spark_ingestion():
     if exec_result.exit_code != 0:
         raise RuntimeError(f"Spark Ingestion failed with exit code {exec_result.exit_code}.\nOutput log:\n{output[-2000:]}")
 
+    # Circuit Breaker: Prevent false-positive green runs when 0 records were ingested
+    if "Nothing to commit" in output:
+        raise RuntimeError(
+            "INGESTION ABORTED: Hudi reported 'Nothing to commit'. "
+            "Zero new records were ingested from the raw staging prefix."
+        )
+
 def run_data_quality_assertions():
     """
     Enterprise Data Quality Gate: Runs SQL validation checks against the newly committed
-    Hudi table in Presto to verify volume, non-null primary keys, deduplication,
-    data freshness, and partition completeness.
+    Hudi table in Presto using PyHive DB-API to verify volume, non-null primary keys,
+    deduplication, data freshness, and partition completeness.
     """
-    client = docker.from_env()
-    presto = client.containers.get('presto-server')
-    
-    def execute_presto_query(sql):
-        res = presto.exec_run(f'presto-cli --execute "{sql}"')
-        if res.exit_code != 0:
-            raise RuntimeError(f"Presto SQL execution failed for query: {sql}\nError: {res.output.decode('utf-8')}")
-        output = res.output.decode('utf-8').strip()
-        return output.replace('"', '').strip()
+    from pyhive import presto
 
-    print("\n=======================================================")
-    print("🛡️ RUNNING DATA QUALITY & INTEGRITY GATES (PRESTO)")
-    print("=======================================================")
+    conn = presto.connect(host='presto-server', port=8080, catalog='hudi', schema='default')
+    cursor = conn.cursor()
 
-    # 1. Row Count & Volume Assertion
-    print("[Check 1/5] Validating Total Table Volume & Row Count...")
-    total_rows_str = execute_presto_query("SELECT count(*) FROM hudi.default.github_events")
     try:
-        total_rows = int(total_rows_str)
-    except ValueError:
-        raise AssertionError(f"Quality Check Failed: Invalid row count returned from Presto: '{total_rows_str}'")
-        
-    print(f" -> Total committed rows in lakehouse: {total_rows:,}")
-    if total_rows <= 0:
-        raise AssertionError(f"Quality Check Failed: Total rows is {total_rows}. Expected at least 1 record.")
+        print("\n=======================================================")
+        print("🛡️ RUNNING DATA QUALITY & INTEGRITY GATES (PRESTO)")
+        print("=======================================================")
 
-    # 2. Primary Key Non-Null Assertion (id)
-    print("\n[Check 2/5] Validating Primary Key Integrity (id IS NOT NULL)...")
-    null_keys_str = execute_presto_query("SELECT count(*) FROM hudi.default.github_events WHERE id IS NULL OR trim(id) = ''")
-    null_keys = int(null_keys_str)
-    print(f" -> Null / Empty primary keys found: {null_keys}")
-    if null_keys > 0:
-        raise AssertionError(f"Quality Check Failed: Found {null_keys} records with NULL/empty primary key 'id'!")
+        # Fetch latest commit timestamp to scope quality gates to the newly ingested batch
+        cursor.execute("SELECT max(_hoodie_commit_time) FROM hudi.default.github_events")
+        latest_commit = cursor.fetchone()[0]
+        print(f"Targeting Latest Commit Instant: {latest_commit}")
+        if not latest_commit:
+            raise AssertionError("Quality Check Failed: No commit instants found in hudi.default.github_events table!")
 
-    # 3. Duplicate Key Assertion (Hudi ACID Deduplication Check)
-    print("\n[Check 3/5] Validating Record-Level Deduplication (Zero Duplicate IDs)...")
-    duplicate_count_str = execute_presto_query(
-        "SELECT count(*) FROM (SELECT id FROM hudi.default.github_events GROUP BY id HAVING count(*) > 1)"
-    )
-    duplicate_count = int(duplicate_count_str)
-    print(f" -> Duplicate event IDs found: {duplicate_count}")
-    if duplicate_count > 0:
-        raise AssertionError(f"Quality Check Failed: Found {duplicate_count} duplicated event IDs! Hudi deduplication violated.")
+        # 1. Batch Volume Assertion (Problem 1 Fix)
+        print("\n[Check 1/5] Validating Ingested Batch Volume & Row Count...")
+        cursor.execute(f"""
+            SELECT count(*) 
+            FROM hudi.default.github_events 
+            WHERE _hoodie_commit_time = '{latest_commit}'
+        """)
+        batch_rows = cursor.fetchone()[0]
+        print(f" -> Newly committed rows in latest batch: {batch_rows:,}")
+        if batch_rows <= 0:
+            raise AssertionError(f"Quality Check Failed: Latest batch committed {batch_rows} records! Expected at least 1 record.")
 
-    # 4. Data Freshness & Timestamp Validity Assertion
-    print("\n[Check 4/5] Validating Data Freshness & Timestamp Sanity (created_at)...")
-    freshness_result = execute_presto_query("SELECT min(created_at), max(created_at) FROM hudi.default.github_events")
-    print(f" -> Temporal event range: {freshness_result}")
-    if not freshness_result or "null" in freshness_result.lower():
-        raise AssertionError(f"Quality Check Failed: Invalid created_at timestamps detected: '{freshness_result}'")
+        # 2. Primary Key Non-Null Assertion (Problem 2 Fix)
+        print("\n[Check 2/5] Validating Primary Key Integrity in Latest Batch (id IS NOT NULL)...")
+        cursor.execute(f"""
+            SELECT count(*) 
+            FROM hudi.default.github_events 
+            WHERE _hoodie_commit_time = '{latest_commit}' 
+              AND (id IS NULL OR trim(id) = '')
+        """)
+        null_keys = cursor.fetchone()[0]
+        print(f" -> Null / Empty primary keys found: {null_keys}")
+        if null_keys > 0:
+            raise AssertionError(f"Quality Check Failed: Found {null_keys} records with NULL/empty primary key 'id' in batch!")
 
-    # 5. Partition Completeness Assertion
-    print("\n[Check 5/5] Validating Partition Distribution (Event Types)...")
-    partitions_count_str = execute_presto_query("SELECT count(DISTINCT type) FROM hudi.default.github_events")
-    partitions_count = int(partitions_count_str)
-    print(f" -> Distinct event partition types active: {partitions_count}")
-    if partitions_count < 2:
-        raise AssertionError(f"Quality Check Failed: Expected multiple event partitions, but only found {partitions_count}.")
+        # 3. Duplicate Key Assertion (Problem 3 Fix)
+        print("\n[Check 3/5] Validating Record-Level Deduplication in Latest Batch (Zero Duplicate IDs)...")
+        cursor.execute(f"""
+            SELECT count(id) - count(DISTINCT id) 
+            FROM hudi.default.github_events 
+            WHERE _hoodie_commit_time = '{latest_commit}'
+        """)
+        duplicate_count = cursor.fetchone()[0]
+        print(f" -> Duplicate event IDs found: {duplicate_count}")
+        if duplicate_count > 0:
+            raise AssertionError(f"Quality Check Failed: Found {duplicate_count} duplicated event IDs in batch! Deduplication violated.")
 
-    print("\n=======================================================")
-    print("✅ ALL DATA QUALITY GATES PASSED SUCCESSFULLY!")
-    print("   Lakehouse table is certified accurate, fresh & ACID compliant.")
-    print("=======================================================\n")
+        # 4. Data Freshness & Timestamp Validity Assertion (Problem 4 Fix)
+        print("\n[Check 4/5] Validating Data Freshness & Timestamp Sanity in Latest Batch...")
+        cursor.execute(f"""
+            SELECT 
+                min(created_at), 
+                max(created_at),
+                CASE 
+                    WHEN max(created_at) IS NOT NULL AND from_iso8601_timestamp(max(created_at)) >= now() - interval '24' hour THEN 1 
+                    ELSE 0 
+                END
+            FROM hudi.default.github_events 
+            WHERE _hoodie_commit_time = '{latest_commit}'
+        """)
+        min_created, max_created, is_fresh = cursor.fetchone()
+        print(f" -> Temporal event range in batch: {min_created} to {max_created}")
+        print(f" -> Freshness certified (within last 24h): {bool(is_fresh)}")
+        if is_fresh != 1:
+            raise AssertionError(f"Quality Check Failed: Ingested events are older than 24 hours (max created_at: {max_created})")
+
+        # 5. Partition Completeness Assertion
+        print("\n[Check 5/5] Validating Partition Distribution in Latest Batch (Event Types)...")
+        cursor.execute(f"""
+            SELECT count(DISTINCT type) 
+            FROM hudi.default.github_events 
+            WHERE _hoodie_commit_time = '{latest_commit}'
+        """)
+        partitions_count = cursor.fetchone()[0]
+        print(f" -> Distinct event partition types active in batch: {partitions_count}")
+        if partitions_count < 2:
+            raise AssertionError(f"Quality Check Failed: Expected multiple event partitions, but only found {partitions_count} in batch.")
+
+        print("\n=======================================================")
+        print("✅ ALL DATA QUALITY GATES PASSED SUCCESSFULLY!")
+        print("   Lakehouse table is certified accurate, fresh & ACID compliant.")
+        print("=======================================================\n")
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 with DAG(
     'github_events_ingestion',

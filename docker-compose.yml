@@ -2,26 +2,69 @@ x-presto-entrypoint: &presto-entrypoint >
   /bin/sh -c "
   mkdir -p /tmp/etc &&
   cp -r /opt/presto-server/etc/* /tmp/etc/ &&
-  echo \"hive.s3.endpoint=\$$B2_ENDPOINT\" >> /tmp/etc/catalog/hudi.properties &&
+  echo \"hive.s3.endpoint=\$$S3_ENDPOINT\" >> /tmp/etc/catalog/hudi.properties &&
   echo \"hive.s3.aws-access-key=\$$AWS_ACCESS_KEY_ID\" >> /tmp/etc/catalog/hudi.properties &&
   echo \"hive.s3.aws-secret-key=\$$AWS_SECRET_ACCESS_KEY\" >> /tmp/etc/catalog/hudi.properties &&
+  echo \"hive.s3.path-style-access=\$$S3_PATH_STYLE_ACCESS\" >> /tmp/etc/catalog/hudi.properties &&
+  echo \"hive.s3.ssl.enabled=\$$S3_SSL_ENABLED\" >> /tmp/etc/catalog/hudi.properties &&
   exec /opt/presto-server/bin/launcher --etc-dir /tmp/etc run
   "
 
 services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: on-failure
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "/bin/curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse-network
+
+  minio-init:
+    image: minio/minio:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /bin/mc alias set local http://minio:9000 $${AWS_ACCESS_KEY_ID:-minioadmin} $${AWS_SECRET_ACCESS_KEY:-minioadmin} &&
+      /bin/mc mb --ignore-existing local/$${S3_BUCKET_NAME:-github-raw-data} &&
+      echo 'MinIO storage initialized successfully' &&
+      exit 0
+      "
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-github-raw-data}
+    networks:
+      - lakehouse-network
+
   mysql-db:
     image: mysql:8.0
     container_name: mysql-db
     restart: on-failure
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
       MYSQL_DATABASE: metastore_db
       MYSQL_USER: hive
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-hivepassword}
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uhive", "-p$$MYSQL_PASSWORD"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uhive -p$$MYSQL_PASSWORD"]
       timeout: 5s
       retries: 12
       interval: 5s
@@ -30,20 +73,34 @@ services:
 
   hive-metastore:
     image: apache/hive:3.1.3
+    platform: linux/amd64
     container_name: hive-metastore
     restart: on-failure
+    user: root
     ports:
       - "9083:9083"
     environment:
       - SERVICE_NAME=metastore
       - DB_DRIVER=mysql
-      - IS_RESUME=true
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_PATH_STYLE_ACCESS=${S3_PATH_STYLE_ACCESS:-true}
+      - S3_SSL_ENABLED=${S3_SSL_ENABLED:-false}
       - HADOOP_CLASSPATH=/opt/hadoop/share/hadoop/tools/lib/*
-      - HADOOP_OPTS=-Dfs.s3a.endpoint=${B2_ENDPOINT}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - HADOOP_OPTS=-Djavax.jdo.option.ConnectionPassword=${MYSQL_PASSWORD:-hivepassword}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    entrypoint: >
+      /bin/bash -c "
+      cp /opt/hive/conf/hive-site.xml.template /opt/hive/conf/hive-site.xml &&
+      sed -i \"s|{{S3_ENDPOINT}}|\$$S3_ENDPOINT|g\" /opt/hive/conf/hive-site.xml &&
+      sed -i \"s|{{S3_PATH_STYLE_ACCESS}}|\$${S3_PATH_STYLE_ACCESS:-true}|g\" /opt/hive/conf/hive-site.xml &&
+      sed -i \"s|{{S3_SSL_ENABLED}}|\$${S3_SSL_ENABLED:-false}|g\" /opt/hive/conf/hive-site.xml &&
+      ln -sfn /opt/hive/conf/hive-site.xml /opt/hadoop/etc/hadoop/core-site.xml &&
+      (/opt/hive/bin/schematool -dbType mysql -info || /opt/hive/bin/schematool -dbType mysql -initSchema) &&
+      IS_RESUME=true exec /entrypoint.sh
+      "
     volumes:
-      - ./metastore/metastore-site.xml:/opt/hive/conf/hive-site.xml
+      - ./metastore/metastore-site.xml:/opt/hive/conf/hive-site.xml.template
       - ./metastore/lib/mysql-connector-j-8.0.33.jar:/opt/hive/lib/mysql-connector-j-8.0.33.jar
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/localhost/9083"]
@@ -54,18 +111,21 @@ services:
     depends_on:
       mysql-db:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     networks:
       - lakehouse-network
 
   presto-server:
-    image: prestodb/presto:0.297
+    image: prestodb/presto:0.299
     container_name: presto-server
     restart: on-failure
     environment:
-      - B2_ENDPOINT=${B2_ENDPOINT}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - S3_PATH_STYLE_ACCESS=${S3_PATH_STYLE_ACCESS:-true}
+      - S3_SSL_ENABLED=${S3_SSL_ENABLED:-false}
     entrypoint: *presto-entrypoint
     ports:
       - "8080:8080"
@@ -83,18 +143,21 @@ services:
     depends_on:
       hive-metastore:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     networks:
       - lakehouse-network
 
   presto-worker-1:
-    image: prestodb/presto:0.297
+    image: prestodb/presto:0.299
     container_name: presto-worker-1
     restart: on-failure
     environment:
-      - B2_ENDPOINT=${B2_ENDPOINT}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - S3_PATH_STYLE_ACCESS=${S3_PATH_STYLE_ACCESS:-true}
+      - S3_SSL_ENABLED=${S3_SSL_ENABLED:-false}
     entrypoint: *presto-entrypoint
     volumes:
       - ./presto/worker-1/config.properties:/opt/presto-server/etc/config.properties
@@ -108,14 +171,15 @@ services:
       - lakehouse-network
 
   presto-worker-2:
-    image: prestodb/presto:0.297
+    image: prestodb/presto:0.299
     container_name: presto-worker-2
     restart: on-failure
     environment:
-      - B2_ENDPOINT=${B2_ENDPOINT}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - S3_PATH_STYLE_ACCESS=${S3_PATH_STYLE_ACCESS:-true}
+      - S3_SSL_ENABLED=${S3_SSL_ENABLED:-false}
     entrypoint: *presto-entrypoint
     volumes:
       - ./presto/worker-2/config.properties:/opt/presto-server/etc/config.properties
@@ -134,26 +198,39 @@ services:
     restart: on-failure
     user: root
     environment:
-      - B2_ENDPOINT=${B2_ENDPOINT}
-      - B2_BUCKET_NAME=${B2_BUCKET_NAME}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-github-raw-data}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - S3_PATH_STYLE_ACCESS=${S3_PATH_STYLE_ACCESS:-true}
+      - S3_SSL_ENABLED=${S3_SSL_ENABLED:-false}
       - SPARK_CONF_DIR=/tmp/spark-conf
     entrypoint: >
       /bin/sh -c "
-      mkdir -p /tmp/spark-conf &&
+      mkdir -p /tmp/spark-conf /tmp/spark-events &&
       cp /opt/spark/conf/spark-defaults.conf /tmp/spark-conf/ &&
-      echo \"spark.hadoop.fs.s3a.endpoint \$$B2_ENDPOINT\" >> /tmp/spark-conf/spark-defaults.conf &&
+      echo \"spark.hadoop.fs.s3a.endpoint \$$S3_ENDPOINT\" >> /tmp/spark-conf/spark-defaults.conf &&
+      echo \"spark.hadoop.fs.s3a.path.style.access \$$S3_PATH_STYLE_ACCESS\" >> /tmp/spark-conf/spark-defaults.conf &&
+      echo \"spark.hadoop.fs.s3a.connection.ssl.enabled \$$S3_SSL_ENABLED\" >> /tmp/spark-conf/spark-defaults.conf &&
+      /opt/spark/sbin/start-history-server.sh &&
+      (if [ ! -f /root/.ivy2/jars/org.apache.hudi_hudi-utilities-slim-bundle_2.12-0.15.0.jar ]; then
+        echo 'Prefetching Hudi dependencies in background...' &&
+        /opt/spark/bin/spark-submit --packages 'org.apache.hudi:hudi-utilities-slim-bundle_2.12:0.15.0,org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0,org.apache.hadoop:hadoop-aws:3.3.4' --class org.apache.hudi.utilities.streamer.HoodieStreamer /dev/null --help >/dev/null 2>&1 || true
+      fi &) &&
       tail -f /dev/null
       "
     ports:
       - "4040:4040"
+      - "18080:18080"
     volumes:
       - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
       - ./spark/github-ingest.properties:/opt/spark/conf/github-ingest.properties
       - ./spark/github-schema.avsc:/opt/spark/conf/github-schema.avsc
       - ./spark/hudi_acid_superpowers_demo.py:/opt/spark/hudi_acid_superpowers_demo.py
+      - spark-ivy-cache:/root/.ivy2
+    depends_on:
+      minio:
+        condition: service_healthy
     networks:
       - lakehouse-network
 
@@ -164,16 +241,23 @@ services:
     user: root
     environment:
       - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
-      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/data/airflow.db
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
       - PYTHONPATH=/home/airflow/.local/lib/python3.9/site-packages
       - PATH=/home/airflow/.local/bin:/usr/local/bin:/usr/bin:/bin
-      - B2_ENDPOINT=${B2_ENDPOINT}
-      - B2_BUCKET_NAME=${B2_BUCKET_NAME}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
-      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-github-raw-data}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - S3_PATH_STYLE_ACCESS=${S3_PATH_STYLE_ACCESS:-true}
+      - S3_SSL_ENABLED=${S3_SSL_ENABLED:-false}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW__WEBSERVER__SECRET_KEY:-airflow_session_secret_key_lakehouse_production_secure_789}
+      - AIRFLOW__WEBSERVER__SESSION_LIFETIME_MINUTES=43200
+      - AIRFLOW__WEBSERVER__FORCE_LOG_OUT_AFTER=43200
+      - AIRFLOW__WEBSERVER__COOKIE_SECURE=false
+      - AIRFLOW__WEBSERVER__COOKIE_SAMESITE=Lax
       - _AIRFLOW_WWW_USER_CREATE=true
       - _AIRFLOW_WWW_USER_USERNAME=admin
       - _AIRFLOW_WWW_USER_PASSWORD=admin
@@ -182,15 +266,21 @@ services:
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - /var/run/docker.sock:/var/run/docker.sock
+      - airflow-data:/opt/airflow/data
+      - airflow-logs:/opt/airflow/logs
     entrypoint: >
       /bin/bash -c "
-      /usr/local/bin/pip install --no-cache-dir docker boto3 &&
-      rm -f /opt/airflow/airflow-webserver.pid &&
+      python3 -c 'import docker, boto3, pyhive' 2>/dev/null || /usr/local/bin/pip install --no-cache-dir docker boto3 'pyhive[presto]' &&
+      rm -f /opt/airflow/airflow-webserver.pid /opt/airflow/*.pid &&
+      mkdir -p /opt/airflow/data &&
       airflow db init &&
-      (airflow users delete --username admin || true) &&
-      airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@admin.com &&
+      (grep -q 'SESSION_COOKIE_NAME' /opt/airflow/webserver_config.py 2>/dev/null || echo \"SESSION_COOKIE_NAME = 'airflow_session'\" >> /opt/airflow/webserver_config.py) &&
+      (airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@admin.com || true) &&
       exec airflow standalone
       "
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
     networks:
       - lakehouse-network
 
@@ -200,7 +290,7 @@ services:
     restart: on-failure
     user: root
     environment:
-      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY:-superset_secret_key_for_lakehouse_visualization_12345}
     entrypoint: >
       /bin/sh -c "
       if [ ! -d '/app/.venv/lib/python3.10/site-packages/pyhive' ]; then
@@ -225,8 +315,12 @@ services:
       - lakehouse-network
 
 volumes:
+  minio-data:
   mysql-data:
   superset-data:
+  spark-ivy-cache:
+  airflow-data:
+  airflow-logs:
 
 networks:
   lakehouse-network:

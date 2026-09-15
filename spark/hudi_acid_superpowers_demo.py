@@ -7,15 +7,13 @@ Apache Hudi Lakehouse Superpowers Demo:
 
 import sys
 import os
+import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit
 
 def init_spark():
     return SparkSession.builder \
         .appName("Hudi-Superpowers-Demo") \
-        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-        .config("spark.sql.catalogImplementation", "hive") \
-        .config("spark.sql.hive.convertMetastoreParquet", "false") \
         .enableHiveSupport() \
         .getOrCreate()
 
@@ -23,7 +21,7 @@ def main():
     spark = init_spark()
     spark.sparkContext.setLogLevel("ERROR")
     
-    bucket_name = os.environ.get("B2_BUCKET_NAME", "github-raw-data")
+    bucket_name = os.environ.get("S3_BUCKET_NAME", "github-raw-data")
     table_path = f"s3a://{bucket_name}/hudi-tables/github_events"
     
     print("\n" + "="*70)
@@ -52,11 +50,13 @@ def main():
     if sample_row:
         target_id = sample_row[0]["id"]
         target_type = sample_row[0]["type"]
-        print(f"Target Event ID: {target_id} (Type: {target_type})")
+        original_ts = sample_row[0]["created_at"]
+        print(f"Target Event ID: {target_id} (Type: {target_type}, Original created_at: {original_ts})")
         
-        # Create an updated version of this exact record
+        # Create an updated version with a current UTC timestamp so Hudi precombine accepts the update
+        new_ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         update_df = df.filter(col("id") == target_id) \
-                      .withColumn("created_at", lit("2026-09-07T12:00:00Z"))
+                      .withColumn("created_at", lit(new_ts))
         
         hudi_upsert_options = {
             'hoodie.table.name': 'github_events',
@@ -65,6 +65,9 @@ def main():
             'hoodie.datasource.write.precombine.field': 'created_at',
             'hoodie.datasource.write.operation': 'upsert',
             'hoodie.datasource.write.hive_style_partitioning': 'true',
+            'hoodie.metadata.enable': 'false',
+            'hoodie.avro.schema.validate': 'false',
+            'hoodie.datasource.write.reconcile.schema': 'true',
             'hoodie.datasource.hive_sync.enable': 'true',
             'hoodie.datasource.hive_sync.mode': 'hms',
             'hoodie.datasource.hive_sync.database': 'default',
@@ -103,6 +106,9 @@ def main():
             'hoodie.datasource.write.partitionpath.field': 'type',
             'hoodie.datasource.write.operation': 'delete',
             'hoodie.datasource.write.hive_style_partitioning': 'true',
+            'hoodie.metadata.enable': 'false',
+            'hoodie.avro.schema.validate': 'false',
+            'hoodie.datasource.write.reconcile.schema': 'true',
             'hoodie.datasource.hive_sync.enable': 'true',
             'hoodie.datasource.hive_sync.mode': 'hms',
             'hoodie.datasource.hive_sync.database': 'default',

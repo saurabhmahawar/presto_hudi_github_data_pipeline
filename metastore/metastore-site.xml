@@ -14,11 +14,7 @@
     <name>javax.jdo.option.ConnectionUserName</name>
     <value>hive</value>
   </property>
-  <property>
-    <!-- IMPORTANT: This value MUST match MYSQL_PASSWORD in .env -->
-    <name>javax.jdo.option.ConnectionPassword</name>
-    <value>hivepassword</value>
-  </property>
+  <!-- NOTE: javax.jdo.option.ConnectionPassword is dynamically passed via HADOOP_OPTS in docker-compose.yml from .env -->
 
   <!-- Thrift Metastore Service Configuration -->
   <property>
@@ -35,14 +31,17 @@
   </property>
 
   <!-- S3A Storage Configurations -->
-  <!-- Primary endpoint set via HADOOP_OPTS env var in docker-compose; this is the XML fallback -->
   <property>
     <name>fs.s3a.endpoint</name>
-    <value>s3.us-east-005.backblazeb2.com</value>
+    <value>{{S3_ENDPOINT}}</value>
   </property>
   <property>
     <name>fs.s3a.path.style.access</name>
-    <value>false</value>
+    <value>{{S3_PATH_STYLE_ACCESS}}</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.ssl.enabled</name>
+    <value>{{S3_SSL_ENABLED}}</value>
   </property>
   <property>
     <name>fs.s3a.aws.credentials.provider</name>

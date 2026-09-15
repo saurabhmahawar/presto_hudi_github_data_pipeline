@@ -8,7 +8,7 @@ orchestrates the whole thing with [Apache Airflow](https://airflow.apache.org/) 
 SQL-based data-quality gate.
 
 <p align="center">
-  <img src="docs/lakehouse_architecture.png" alt="Lakehouse Architecture Diagram" width="100%" />
+  <img src="images/lakehouse_architecture.png" alt="Lakehouse Architecture Diagram" width="100%" />
 </p>
 
 ### Scope and honest limitations
@@ -64,7 +64,7 @@ Everything else below is verified against the running stack.
 ## How the pipeline works
 
 <p align="center">
-  <img src="docs/pipeline_flow.png" alt="Pipeline Flow Diagram" width="85%" />
+  <img src="images/pipeline_flow.png" alt="Pipeline Flow Diagram" width="85%" />
 </p>
 
 Task dependency is strictly linear: `download → ingest → quality gate`. A failure at any step
@@ -85,8 +85,9 @@ presto-hudi-cos/
 ├── .gitignore                            # Excludes secrets, JARs (except the JDBC driver), caches, OS cruft
 ├── docker-compose.yml                    # Defines all 10 services, 6 volumes, and 1 network
 │
-├── docs/
-│   └── lakehouse_architecture.png        # Architecture diagram used above
+├── images/
+│   ├── lakehouse_architecture.png        # Architecture diagram used above
+│   └── pipeline_flow.png                 # Pipeline flow diagram
 │
 ├── airflow/
 │   └── dags/

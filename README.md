@@ -134,383 +134,185 @@ presto-hudi-cos/
 │   └── worker-2/                         # Byte-identical to worker-1 except node.id
 │
 └── spark/
-    ├── spark-defaults.conf               # Kryo, Hive catalog, S3A, event logging
-    ├── github-ingest.properties          # 18 HoodieStreamer / Hudi table properties
-    ├── github-schema.avsc                # Avro schema: 8 top-level fields, 15-field payload record
-    └── hudi_acid_superpowers_demo.py     # Standalone PySpark demo (upsert / delete / time travel)
+    ├── spark-defaults.conf               # Kryo serializer, Hive catalog, S3A connector, event logs
+    ├── github-ingest.properties          # 18 HoodieStreamer table, sync, and clustering properties
+    ├── github-schema.avsc                # Avro schema contract (8 top-level fields, nested payload)
+    └── hudi_acid_superpowers_demo.py     # Standalone PySpark demo: upserts, GDPR deletes, time travel
 ```
 
 ---
 
 ## File-by-file reference
 
-### `docker-compose.yml`
-
-Single source of truth for the stack. Defines **10 services**, **6 named volumes**, and one bridge
-network (`lakehouse-network`). Three patterns are worth understanding:
-
-**1. Startup ordering via health gates.** Services declare `depends_on: { condition: service_healthy }`
-rather than plain `depends_on`, so Hive waits for MySQL to actually accept connections, Presto waits
-for Hive, and Airflow waits for `minio-init` to have *completed successfully*
-(`condition: service_completed_successfully`).
-
-**2. Config templating at container start.** Several images need configuration that depends on `.env`
-values, which static config files cannot express. Each affected service rewrites its config in its
-entrypoint before starting the real process — see the service reference below for the exact steps.
-
-**3. A YAML anchor for Presto.** `x-presto-entrypoint: &presto-entrypoint` is defined once at the top
-of the file and referenced by all three Presto services via `*presto-entrypoint`, so the coordinator
-and both workers share one entrypoint definition.
-
-### `airflow/dags/github_ingestion_dag.py`
-
-The complete pipeline — one DAG (`github_events_ingestion`, `schedule='@daily'`, `catchup=False`)
-with three `PythonOperator` tasks and one callback. Default args set `retries: 1` and
-`retry_delay: 5 minutes`.
-
-#### `download_and_upload_github_data()` → task `download_and_upload_raw_data`
-
-Stages raw data into object storage using **boto3** (the S3 API, not Hadoop's `s3a://`).
-
-- Computes `base_time = utcnow() - 3 hours`, then walks **24 hours backwards** from there. The
-  3-hour offset exists because GitHub Archive publishes each hourly file with a lag; requesting the
-  current hour would reliably 404. Effective window: roughly `now-3h` back to `now-27h`.
-- Builds filenames as `YYYY-MM-DD-H.json.gz`. Note the hour is **not zero-padded** — that is
-  GitHub Archive's actual naming convention (`2026-09-08-9.json.gz`, not `-09`).
-- Deletes everything under the `github-raw/` prefix first, so each run ingests a clean, deterministic batch.
-- Downloads each file with up to **3 attempts** and linear backoff, rejects any response under
-  1 KB as truncated, uploads to `s3://$S3_BUCKET_NAME/github-raw/`, and deletes the local temp file
-  in a `finally` block.
-- Uses `Config(s3={'addressing_style': 'path'})`, required for MinIO, which does not support
-  virtual-host-style bucket addressing.
-- **Tolerates partial failure**: it aborts only if *all 24* files fail. Any lesser number logs a
-  warning and continues, because the newest hour is often not yet published.
-
-#### `trigger_spark_ingestion()` → task `trigger_hudi_ingestion`
-
-Runs the Spark job **in a different container**. Airflow mounts `/var/run/docker.sock`, so it uses
-the Docker SDK (`docker.from_env()`) to `exec` `spark-submit` inside `spark-client`.
-
-Key submit arguments:
-
-| Argument | Value | Why |
-| :--- | :--- | :--- |
-| `--master` | `local[4]` | Caps concurrent partitions at 4. See [Design decisions](#why-local4-and-6-gb-of-driver-memory). |
-| `--driver-memory` | `6G` | In local mode the driver does all the work; there are no executors. |
-| `--class` | `org.apache.hudi.utilities.streamer.HoodieStreamer` | Hudi's batch/streaming ingestion utility. |
-| `--packages` | `hudi-utilities-slim-bundle_2.12:0.15.0`, `hudi-spark3.5-bundle_2.12:0.15.0`, `hadoop-aws:3.3.4` | The slim bundle must be paired with the matching Spark bundle. |
-| `--source-class` | `JsonDFSSource` | Reads newline-delimited JSON from a filesystem/object-store path. |
-| `--source-ordering-field` | `created_at` | Hudi's precombine key — on duplicate record keys, the later value wins. |
-| `--table-type` | `COPY_ON_WRITE` | Rewrites Parquet files on update. Best read performance; higher write cost. |
-| `--source-limit` | `1073741824` | Caps one batch at 1 GiB of source bytes. A full day is ~430 MB, so it does not normally bind. |
-| `--enable-hive-sync` | — | Registers the table and its partitions in the Hive Metastore. |
-
-After the job, the task performs **two** checks:
-
-1. Non-zero exit code → `RuntimeError` with the last 2000 characters of output.
-2. Output containing `"Nothing to commit"` → `RuntimeError`. This is a deliberate **circuit
-   breaker**: Hudi exits 0 when it finds no new source files, which would otherwise mark the task
-   green without ingesting a single row.
-
-#### `run_data_quality_assertions()` → task `run_data_quality_assertions`
-
-Connects to Presto over PyHive's DB-API (`pyhive.presto`) and runs six queries. It first reads
-`max(_hoodie_commit_time)` to identify the newest commit instant, then **scopes all five gates to
-that instant** so each gate judges only the batch that was just written, not the table's history:
-
-| Gate | Assertion | Fails when |
-| :--- | :--- | :--- |
-| 1 | Batch volume | The newest commit contains 0 rows |
-| 2 | Primary-key integrity | Any row has `id IS NULL OR trim(id) = ''` |
-| 3 | Deduplication | `count(id) - count(DISTINCT id) > 0` |
-| 4 | Freshness | `max(created_at)` is more than 24 hours old |
-| 5 | Partition spread | Fewer than 2 distinct `type` values |
-
-The whole body sits inside `try ... finally`, which closes the cursor and connection independently
-so a failure in one cannot leak the other.
-
-#### `pipeline_failure_alert(context)`
-
-`on_failure_callback` for every task. Prints a failure summary to the task log and, when
-`SLACK_WEBHOOK_URL` is set, POSTs a formatted message to it via `urllib.request` (10-second
-timeout). Webhook errors are caught and logged — alerting can never itself fail the DAG.
-
-### `metastore/metastore-site.xml`
-
-A **template**, not a finished config. It is mounted read-only at
-`/opt/hive/conf/hive-site.xml.template`, and the metastore entrypoint copies it to `hive-site.xml`
-after substituting three placeholder tokens: `{{S3_ENDPOINT}}`, `{{S3_PATH_STYLE_ACCESS}}`, and
-`{{S3_SSL_ENABLED}}`.
-
-Contents:
-
-| Property | Purpose |
-| :--- | :--- |
-| `javax.jdo.option.ConnectionURL` | `jdbc:mysql://mysql-db:3306/metastore_db` with `createDatabaseIfNotExist=true` |
-| `javax.jdo.option.ConnectionDriverName` | `com.mysql.cj.jdbc.Driver` |
-| `javax.jdo.option.ConnectionUserName` | `hive` |
-| `hive.metastore.uris` | `thrift://hive-metastore:9083` |
-| `hive.metastore.schema.verification` | `false` |
-| `datanucleus.schema.autoCreateAll` | `false` — schema creation is handled by `schematool`, not DataNucleus |
-| `fs.s3a.endpoint` | Templated from `S3_ENDPOINT` |
-| `fs.s3a.path.style.access` | Templated from `S3_PATH_STYLE_ACCESS` |
-| `fs.s3a.connection.ssl.enabled` | Templated from `S3_SSL_ENABLED` |
-| `fs.s3a.aws.credentials.provider` | `EnvironmentVariableCredentialsProvider` |
-
-Two things this file deliberately does **not** contain:
-
-- **The database password.** It is injected as a JVM system property via `HADOOP_OPTS`
-  (`-Djavax.jdo.option.ConnectionPassword=$MYSQL_PASSWORD`), so the credential lives only in `.env`.
-  This works because Hive's `HiveConf` explicitly copies matching JVM system properties over its XML.
-- **AWS keys.** Only the *provider class* is named; the actual keys are read from the
-  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables at runtime.
-
-> **Why S3A config must live in this file rather than in `HADOOP_OPTS`:** Hadoop's `Configuration`
-> class does **not** read JVM system properties as config keys — unlike `HiveConf`, which does. A
-> `-Dfs.s3a.endpoint=…` flag is silently ignored by S3A. That is why the endpoint is templated into
-> XML, and why the entrypoint additionally symlinks this file as Hadoop's `core-site.xml`.
-
-### `metastore/lib/mysql-connector-j-8.0.33.jar`
-
-The MySQL JDBC driver (2.4 MB), mounted into `/opt/hive/lib/`. The `apache/hive:3.1.3` image ships
-**no** MySQL driver, so without this the metastore cannot reach its own database. This is the one
-JAR deliberately committed to the repository — `.gitignore` excludes `*.jar` but re-includes it with
-`!metastore/lib/*.jar`.
-
-### `presto/*/config.properties`
-
-Node role and cluster topology.
-
-**Coordinator:**
-
-```properties
-coordinator=true
-node-scheduler.include-coordinator=false   # coordinator schedules but does not execute
-http-server.http.port=8080
-query.max-memory=1.5GB                     # cluster-wide cap, enforced by the coordinator
-query.max-memory-per-node=1GB              # see note below
-query.max-total-memory-per-node=1.5GB      # see note below
-discovery-server.enabled=true              # embedded discovery service
-discovery.uri=http://presto-server:8080
-```
-
-**Workers** set `coordinator=false`, omit the discovery server and `query.max-memory`, and point
-`discovery.uri` at the coordinator.
-
-> **Note:** because `node-scheduler.include-coordinator=false`, the coordinator never runs query
-> tasks, so its own `query.max-memory-per-node` and `query.max-total-memory-per-node` have no
-> practical effect. Presto still *binds* them (it refuses to start on genuinely unrecognised
-> properties), so they are harmless — just inert. The values that matter are `query.max-memory`
-> on the coordinator and the per-node limits on the workers.
-
-### `presto/*/jvm.config`
-
-```properties
--Xmx3G                     # heap ceiling
--XX:+UseG1GC
--XX:G1ReservePercent=15
--XX:+ExplicitGCInvokesConcurrent
--XX:+HeapDumpOnOutOfMemoryError
--XX:+ExitOnOutOfMemoryError
--Djdk.attach.allowAttachSelf=true
-+ 17 × --add-opens=…       # JDK 17 module access
-```
-
-The **17 `--add-opens` flags are load-bearing and easy to lose.** The `prestodb/presto:0.299` image
-ships its own `jvm.config` containing them, but this repository bind-mounts over that path — so
-omitting them silently strips them. Presto still starts without them, then throws
-`InaccessibleObjectException` deep inside a query when JDK 17's strong encapsulation blocks
-reflective access. The list here is copied verbatim from the image default.
-
-> **General rule for this repo:** before bind-mounting over a path an image already populates, diff
-> against the image first (`docker run --rm --entrypoint cat <image> <path>`). Silent clobbering is
-> the most likely source of subtle breakage here.
-
-### `presto/*/node.properties`
-
-Node identity. `node.environment=test` must match across all nodes or they will not join the same
-cluster. `node.id` is a stable per-node identifier (optional — Presto generates and persists one if
-absent). `node.data-dir=/var/presto/data` is where local state and logs go.
-
-### `presto/*/catalog/hudi.properties`
-
-Defines the `hudi` catalog:
-
-```properties
-connector.name=hudi
-hive.metastore.uri=thrift://hive-metastore:9083
-```
-
-Only two lines, because everything S3-related is appended at container start from `.env`. All three
-copies are byte-identical.
-
-> **The Presto Hudi connector is read-only.** `CREATE TABLE`, `CREATE TABLE AS`, `INSERT`, and
-> `DROP TABLE` all fail with *"This connector does not support …"*. Use Spark SQL for any DDL or DML
-> against `hudi.default.github_events`.
-
-### `spark/spark-defaults.conf`
-
-Baseline Spark configuration, copied into the writable `SPARK_CONF_DIR` at startup and then extended
-with the three `.env`-derived S3A values.
-
-| Property | Value | Purpose |
-| :--- | :--- | :--- |
-| `spark.serializer` | `KryoSerializer` | Required by Hudi. |
-| `spark.sql.catalogImplementation` | `hive` | Use the Hive Metastore as the catalog. |
-| `spark.sql.hive.convertMetastoreParquet` | `false` | **Essential.** Forces Spark to use Hudi's input format instead of its own Parquet reader, which would ignore the Hudi timeline and return duplicate/stale rows. |
-| `spark.hadoop.hive.metastore.uris` | `thrift://hive-metastore:9083` | Metastore location. |
-| `spark.hadoop.fs.s3a.impl` | `S3AFileSystem` | Explicit S3A binding. |
-| `spark.hadoop.fs.s3a.aws.credentials.provider` | `EnvironmentVariableCredentialsProvider` | Read keys from the environment. |
-| `spark.jars.packages` | `hudi-spark3.5-bundle`, `hadoop-aws` | Auto-loaded for interactive sessions such as the demo script. |
-| `spark.eventLog.enabled` / `.dir` | `true` / `file:///tmp/spark-events` | Write event logs for the History Server. |
-| `spark.history.fs.logDirectory` | `file:///tmp/spark-events` | Where the History Server reads them from. |
-
-### `spark/github-ingest.properties`
-
-18 Hudi properties passed to `HoodieStreamer` via `--props`.
-
-| Group | Properties | Meaning |
-| :--- | :--- | :--- |
-| **Table keys** | `recordkey.field=id`, `precombine.field=created_at`, `partitionpath.field=type` | `id` is the primary key; on conflict the later `created_at` wins; files are partitioned by event type. |
-| **Partition style** | `hive_style_partitioning=true` | Directories are written as `type=PushEvent/`, which Hive and Presto understand natively. |
-| **Metastore sync** | `hive_sync.enable`, `.mode=hms`, `.database=default`, `.table=github_events`, `.metastore.uris` | Sync straight to the metastore over Thrift (`hms` mode), not via a HiveServer2 JDBC connection. |
-| **Schema provider** | `schemaprovider.class=FilebasedSchemaProvider`, `source.schema.file`, `target.schema.file` | Both source and target schemas come from `github-schema.avsc`. |
-| **Lifecycle** | `metadata.enable=false`, `cleaner.commits.retained=5`, `clustering.inline=true`, `clustering.inline.max.commits=4` | Metadata table off (simpler for a demo); keep 5 commits of history for time travel; compact small files inline every 4 commits. |
-
-### `spark/github-schema.avsc`
-
-The Avro schema that defines the table. **8 top-level fields**, matching GitHub Archive's event
-envelope exactly:
-
-| Field | Type | Notes |
-| :--- | :--- | :--- |
-| `id` | `string` | Hudi record key. GitHub returns this as a string, not a number. |
-| `type` | `string` | Event type — also the partition column. |
-| `public` | `boolean` | |
-| `created_at` | `string` | ISO-8601 (`2026-09-08T10:00:00Z`). Hudi precombine field. |
-| `actor` | record (6) | `id`, `login`, `display_login`, `gravatar_id`, `url`, `avatar_url` |
-| `repo` | record (3) | `id`, `name`, `url` |
-| `org` | record (5) | `id`, `login`, `gravatar_id`, `url`, `avatar_url` — present on ~14% of events |
-| `payload` | record (15) | See below |
-
-The `payload` record holds 11 scalars — `action`, `ref`, `ref_type`, `master_branch`,
-`description`, `pusher_type`, `push_id`, `head`, `before`, `number`, `repository_id` — plus four
-nested records: `issue`, `pull_request` (including `head`/`base` sub-records carrying branch `ref`
-and commit `sha`), `comment`, and `release`.
-
-Every field is a nullable union (`["null", T]`) with `default: null`, because GitHub's payload shape
-varies by event type: a `PushEvent` populates `push_id`/`ref`/`head`/`before` while a
-`PullRequestEvent` populates `action`/`number`/`pull_request` instead.
-
-### `spark/hudi_acid_superpowers_demo.py`
-
-A **standalone, manually-run** PySpark script (nothing in the DAG or compose file invokes it; it is
-mounted into `spark-client` ready to use). It requires the table to exist and exits with a clear
-message if it does not. Three demonstrations:
-
-1. **ACID upsert** — picks one `PullRequestEvent` or `IssuesEvent`, rewrites its `created_at` to the
-   current UTC timestamp, and writes with `operation=upsert`. The row count is unchanged afterwards,
-   showing record-level mutation without duplication or a full table rewrite.
-2. **GDPR point delete** — selects one `actor.login`, then writes that user's record keys with
-   `operation=delete`, demonstrating "right to be forgotten" without rewriting the table.
-3. **Time travel** — lists the distinct `_hoodie_commit_time` values from the Hudi timeline.
-
-### `.env.example` / `.env`
-
-`.env.example` is the checked-in template; copy it to `.env` (git-ignored) before first launch. Both
-files carry the same **11 keys** — see [Environment variables](#environment-variables).
-
-### `.gitignore`
-
-Excludes `.env`, `__pycache__/`, `*.pyc`, IDE directories, `.DS_Store`, and `*.jar` — with an
-explicit `!metastore/lib/*.jar` exception so the required MySQL JDBC driver is still tracked.
+This guide provides a comprehensive technical breakdown of every repository file, organized by architectural layer. Each entry details the file's primary responsibility, key configuration parameters, and runtime behavior across the lakehouse stack.
 
 ---
 
-## Service-by-service reference
+### 1. Infrastructure & Orchestration
 
-### `minio` — object storage
+#### `docker-compose.yml`
+* **Core Role:** The single source of truth for the local environment, defining all 10 container services, 6 persistent volumes, and 1 isolated bridge network (`lakehouse-network`).
+* **Key Architecture Patterns:**
+  * **Health-Gated Startup Sequences:** Instead of unreliable fixed startup delays, dependent containers declare explicit `condition: service_healthy` checks. For example, the Hive Metastore waits for MySQL to accept TCP connections, Presto waits for the Hive Metastore Thrift port, and Airflow waits for `minio-init` to exit with code `0`.
+  * **Decoupled Dynamic Configuration:** Several container images require parameters populated from `.env`. Container entrypoints interpolate live environment variables into runtime configuration paths (such as `/tmp/etc` in Presto and `/opt/hive/conf` in Hive Metastore) on boot, preventing hardcoded credentials in tracked files.
+  * **Reusable YAML Anchors:** The `x-presto-entrypoint: &presto-entrypoint` anchor defines Presto's entrypoint script once at the file root and injects it across `presto-server`, `presto-worker-1`, and `presto-worker-2`.
+  * **State Persistence:** Dedicated Docker volumes (`minio-data`, `mysql-data`, `airflow-postgres-data`, `superset-data`, `spark-events`, `presto-data`) ensure that raw objects, metadata schemas, DAG run histories, and query logs survive container restarts.
 
-Runs `server /data --console-address ":9001"`. Root credentials come from `AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY`, so one credential pair works for MinIO, boto3, Spark's S3A, and Presto
-alike. Health-gated on `/minio/health/live`, which every dependent service waits for.
+#### `.env.example` / `.env`
+* **Core Role:** Centralized configuration management defining the 11 environment variables shared across all 10 services.
+* **Key Variable Groups:**
+  * **Object Storage & S3:** `S3_ENDPOINT` (`minio:9000`), `S3_BUCKET_NAME` (`github-raw-data`), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (`us-east-1`), `S3_PATH_STYLE_ACCESS` (`true`), `S3_SSL_ENABLED` (`false`).
+  * **Metastore Database:** `MYSQL_ROOT_PASSWORD`, `MYSQL_PASSWORD` (`hivepass`).
+  * **Web UI Security:** `SUPERSET_SECRET_KEY` (used for session signing and CSRF tokens).
+  * **Observability:** `SLACK_WEBHOOK_URL` (optional incoming webhook endpoint for pipeline failure alerts).
+* **Operational Note:** `.env.example` is tracked in version control as a documented baseline. Copy it to `.env` (which is git-ignored) before initial deployment.
 
-### `minio-init` — one-shot bucket creation
+---
 
-A short-lived container using the same MinIO image for its bundled `mc` client. It registers an
-alias, runs `mc mb --ignore-existing` for `$S3_BUCKET_NAME`, prints a confirmation, and exits 0.
-Airflow depends on it with `condition: service_completed_successfully`, so the DAG can never start
-before the bucket exists. Seeing this container in `Exited (0)` state is **correct**, not a failure.
+### 2. Pipeline Workflow (`airflow/`)
 
-### `mysql-db` — metastore backing database
+#### `airflow/dags/github_ingestion_dag.py`
+* **Core Role:** The primary workflow definition. Schedules and orchestrates the daily batch ingestion pipeline (`github_events_ingestion`) across 3 linear tasks with automated retries (`retries: 1`, `retry_delay: 5m`) and failure alert callbacks.
 
-MySQL 8.0 with a `metastore_db` database and a `hive` user. Its health check uses `CMD-SHELL` (not
-`CMD`) specifically so `$MYSQL_PASSWORD` is expanded by a shell — with the plain `CMD` form the
-variable is passed as a literal string.
+* **Detailed Task Breakdown:**
 
-### `hive-metastore` — metadata catalog
+  1. **`download_and_upload_raw_data` (Task 1):**
+     * **Execution Logic:** Computes a 3-hour lag window (`base_time = utcnow() - 3 hours`) and iterates backwards through 24 hourly increments to generate unpadded filenames (`YYYY-MM-DD-H.json.gz`). The 3-hour safety buffer avoids HTTP 404 errors caused by GitHub Archive publishing delays.
+     * **Staging Mechanism:** Streams each hourly archive directly from `data.gharchive.org` to local temporary storage, validates that the downloaded archive exceeds 1 KB (discarding empty files), uploads the payload to `s3://$S3_BUCKET_NAME/github-raw/` using `boto3` path-style addressing, and purges the local temporary file.
+     * **Fault Tolerance:** Logs warnings for individual missing hours without halting the run; raises an exception only if all 24 hourly downloads fail.
 
-The most involved entrypoint in the stack. In order:
+  2. **`trigger_hudi_ingestion` (Task 2):**
+     * **Execution Logic:** Connects to the host Docker daemon over `/var/run/docker.sock` via `docker.from_env()` to run `spark-submit` inside the active `spark-client` container.
+     * **Job Parameters:** Invokes `org.apache.hudi.utilities.streamer.HoodieStreamer` configured with `--master local[4]`, `--driver-memory 6G`, and `--table-type COPY_ON_WRITE`.
+     * **Ingestion Flags:** Reads newline-delimited JSON files via `JsonDFSSource` from `s3a://$S3_BUCKET_NAME/github-raw/`, reconciles fields with `spark/github-schema.avsc`, writes Hudi Parquet files to `s3a://$S3_BUCKET_NAME/hudi-tables/github_events`, and synchronizes table partitions into the Hive Metastore (`--enable-hive-sync`).
+     * **Circuit Breaker:** Streams Spark execution logs in real-time. If Hudi reports `"Nothing to commit"`, the task raises an explicit `RuntimeError` to prevent false-positive pipeline successes when zero new records were ingested.
 
-1. Copy `hive-site.xml.template` → `hive-site.xml`.
-2. `sed` the three `{{…}}` S3 placeholders with live `.env` values.
-3. **Symlink** `hive-site.xml` to `/opt/hadoop/etc/hadoop/core-site.xml`, so Hadoop's S3A client
-   reads the same endpoint settings. (The image's own `core-site.xml` is an empty
-   `<configuration/>`, so nothing is lost.)
-4. Run `schematool -dbType mysql -info || schematool -dbType mysql -initSchema` — an
-   **idempotent self-heal**: probe for an existing schema, and initialise the 74 metastore tables
-   only if the probe fails. Safe on both a fresh volume and a restart.
-5. `IS_RESUME=true exec /entrypoint.sh` — hands off to the image's own entrypoint with schema
-   initialisation disabled, since step 4 already handled it.
+  3. **`run_data_quality_assertions` (Task 3):**
+     * **Execution Logic:** Connects to the Presto coordinator over PyHive DB-API (`port 8080`) and determines the newest batch commit timestamp using `SELECT max(_hoodie_commit_time) FROM default.github_events`.
+     * **Validation Assertions:** Evaluates 5 SQL validation rules strictly scoped to that latest commit instant:
+       * *Batch Volume Check:* Validates that `count(*)` in the batch is greater than 0.
+       * *Primary Key Completeness:* Confirms zero records contain `id IS NULL OR trim(id) = ''`.
+       * *Deduplication Invariant:* Validates that `count(id) - count(DISTINCT id) == 0` (verifying Hudi's upsert deduplication).
+       * *Temporal Freshness:* Ensures the batch `created_at` timestamp falls within the last 24 hours.
+       * *Partition Diversity:* Verifies that at least 2 distinct `type` event partitions were processed in the commit.
 
-> Step 4 exists because setting `IS_RESUME=true` alone means the image **never** creates the schema.
-> On a fresh volume the metastore would start, pass its TCP health check, and then fail every
-> operation with `Table 'metastore_db.DBS' doesn't exist`.
+  4. **`pipeline_failure_alert` (On-Failure Callback):**
+     * **Execution Logic:** Fires automatically if any task encounters an unhandled exception. Assembles execution context (DAG ID, task name, execution date, error trace, log URL) into a structured JSON payload and issues an HTTP POST to `SLACK_WEBHOOK_URL` if configured.
+     * **Resilience:** Wrapped in try/except blocks to ensure webhook network issues cannot mask underlying pipeline execution states.
 
-Runs as `root` because steps 1–3 write inside `/opt`.
+---
 
-### `presto-server`, `presto-worker-1`, `presto-worker-2` — query cluster
+### 3. Metadata Catalog (`metastore/`)
 
-All three share one entrypoint (a YAML anchor). Because `/opt/presto-server/etc/` contains read-only
-bind mounts, the entrypoint **copies the whole directory to `/tmp/etc`**, appends five
-`hive.s3.*` lines derived from `.env` to the catalog file there, and launches with
-`--etc-dir /tmp/etc`. This is what keeps credentials out of the repository while leaving the mounted
-files untouched.
+#### `metastore/metastore-site.xml`
+* **Core Role:** Configuration template for the Apache Hive Metastore service, defining the backing relational database connection, network listener properties, and S3A filesystem credentials.
+* **Key Configuration Parameters:**
+  | Property | Configured Value | Technical Rationale |
+  | :--- | :--- | :--- |
+  | `javax.jdo.option.ConnectionURL` | `jdbc:mysql://mysql-db:3306/metastore_db?...` | Connects the DataNucleus ORM layer to the MySQL database with SSL disabled. |
+  | `javax.jdo.option.ConnectionDriverName` | `com.mysql.cj.jdbc.Driver` | Loads the MySQL Connector/J driver class. |
+  | `javax.jdo.option.ConnectionUserName` | `hive` | MySQL database user for Metastore schema access. |
+  | `hive.metastore.uris` | `thrift://hive-metastore:9083` | Exposes the Thrift RPC service used by Spark, Hudi, and Presto to discover table schemas and partitions. |
+  | `hive.metastore.schema.verification` | `false` | Disables strict version checks to avoid startup failures on minor Metastore schema version mismatches. |
+  | `fs.s3a.endpoint` | `{{S3_ENDPOINT}}` | Interpolated at startup to point S3A filesystem operations to MinIO (`http://minio:9000`). |
+  | `fs.s3a.path.style.access` | `{{S3_PATH_STYLE_ACCESS}}` | Set to `true` to enforce path-style bucket addressing (`endpoint/bucket/`) required by MinIO. |
+  | `fs.s3a.connection.ssl.enabled` | `{{S3_SSL_ENABLED}}` | Set to `false` for internal plain HTTP communication. |
+  | `fs.s3a.aws.credentials.provider` | `EnvironmentVariableCredentialsProvider` | Automatically resolves AWS keys from container environment variables. |
+* **Runtime Initialization:** On boot, the container entrypoint substitutes placeholder tokens (`{{...}}`) with active `.env` values, saves the file to `/opt/hive/conf/hive-site.xml`, and creates a symlink to `/opt/hadoop/etc/hadoop/core-site.xml` so Hadoop's internal S3A client shares the identical endpoint settings. It then executes an idempotent schema check (`schematool -dbType mysql -info || schematool -dbType mysql -initSchema`) to initialize the 74 Metastore tables on fresh volumes.
 
-The coordinator's health check polls `/v1/info` for `"starting":false`; both workers gate on it.
+#### `metastore/lib/mysql-connector-j-8.0.33.jar`
+* **Core Role:** Official MySQL Connector/J JDBC driver enabling the Java-based Hive Metastore to connect to MySQL 8.0 over TCP.
+* **Why It Exists:** Official `apache/hive:3.1.3` images do not bundle third-party database drivers due to licensing terms. Mounting this JAR into `/opt/hive/lib/` ensures the container can connect to MySQL immediately on launch without requiring runtime package downloads.
 
-### `spark-client` — ingestion runtime
+---
 
-A long-lived idle container (`tail -f /dev/null`) that exists to be `docker exec`-ed into by Airflow.
-Its entrypoint:
+### 4. Distributed Query Engine (`presto/`)
 
-1. Creates `/tmp/spark-conf` and `/tmp/spark-events`.
-2. Copies `spark-defaults.conf` into `/tmp/spark-conf` (pointed to by `SPARK_CONF_DIR`) and appends
-   the three `.env`-derived S3A properties.
-3. Starts the **Spark History Server** on port 18080.
-4. **Pre-fetches Hudi dependencies in the background** if
-   `/root/.ivy2/jars/…hudi-utilities-slim-bundle…jar` is absent, by running a throwaway
-   `spark-submit --packages … --help`. This warms the Ivy cache so the first real ingestion does not
-   pay a multi-minute dependency resolution cost.
-5. Idles.
+#### `presto/*/config.properties`
+* **Core Role:** Configures cluster topology, HTTP ports, memory allocations, and node discovery.
+* **Coordinator vs. Worker Settings:**
+  | Setting | Coordinator (`presto/coordinator/`) | Workers (`presto/worker-1/`, `worker-2/`) | Technical Rationale |
+  | :--- | :--- | :--- | :--- |
+  | `coordinator` | `true` | `false` | Designates the master node responsible for parsing SQL, generating distributed query plans, and scheduling tasks. |
+  | `node-scheduler.include-coordinator` | `false` | *(Not applicable)* | Prevents query execution tasks from running on the coordinator, protecting it from worker OOM crashes. |
+  | `discovery-server.enabled` | `true` | *(Not applicable)* | Runs the embedded discovery service so workers can register automatically. |
+  | `discovery.uri` | `http://presto-server:8080` | `http://presto-server:8080` | Cluster registration endpoint. |
+  | `query.max-memory` | `1.5GB` | *(Inherited)* | Total distributed memory ceiling across all nodes for any single query. |
+  | `query.max-memory-per-node` | `1GB` | `1GB` | Maximum user memory allocated on any single node for query processing. |
 
-### `airflow` — orchestrator
+#### `presto/*/jvm.config`
+* **Core Role:** Sets JVM memory boundaries, garbage collection strategies, and JDK module reflection access.
+* **Key Configuration Parameters:**
+  * **Memory Boundaries:** Configured with `-server -Xmx3G` for a 3 GB maximum heap per container.
+  * **Garbage Collection:** Employs `-XX:+UseG1GC` with `-XX:G1ReservePercent=15` to ensure consistent query latencies and avoid long GC pauses during distributed joins and aggregations.
+  * **Fail-Fast Flags:** Includes `-XX:+ExitOnOutOfMemoryError` to trigger immediate process termination and container restart on heap exhaustion, preventing hung or degraded states.
+  * **Java 17 Module Access:** Contains 17 explicit `--add-opens` directives (e.g., `--add-opens=java.base/java.nio=ALL-UNNAMED`, `--add-opens=java.base/java.lang.reflect=ALL-UNNAMED`). Since Java 17 strictly enforces module encapsulation, these flags permit Presto's off-heap memory allocators and internal reflection calls to operate without raising `InaccessibleObjectException`.
 
-Runs `airflow standalone` (scheduler + webserver in one process) with the `SequentialExecutor` over
-SQLite. Its entrypoint installs `docker`, `boto3`, and `pyhive[presto]` **only if they are not
-already importable**, so restarts are fast. It also appends `SESSION_COOKIE_NAME = 'airflow_session'`
-to `webserver_config.py`, which prevents session-cookie collisions with Superset when both are open
-on `localhost` in the same browser.
+#### `presto/*/node.properties`
+* **Core Role:** Establishes unique node identity, environment membership, and local storage directories.
+* **Key Settings:**
+  * `node.environment=test`: Cluster identifier. Every coordinator and worker node must share the identical environment string to join the cluster.
+  * `node.id`: Unique identifier assigned to each node (`presto-coordinator-node-01`, `presto-worker-node-01`, `presto-worker-node-02`).
+  * `node.data-dir=/var/presto/data`: Local directory for operational logs, temporary query spooling, and spill-to-disk operations.
 
-Mounts `/var/run/docker.sock` so it can drive `spark-client`. This is effectively root on the host —
-acceptable for local development, unacceptable for a shared environment.
+#### `presto/*/catalog/hudi.properties`
+* **Core Role:** Registers the `hudi` catalog in Presto, exposing Apache Hudi lakehouse tables as queryable SQL tables.
+* **Key Settings:**
+  * `connector.name=hudi`: Binds Presto's native Apache Hudi connector.
+  * `hive.metastore.uri=thrift://hive-metastore:9083`: Points to the Hive Metastore to discover table schemas and partition boundaries.
+* **Runtime Initialization:** Presto config mounts are read-only. At startup, the entrypoint script copies `/opt/presto-server/etc/` into an ephemeral `/tmp/etc` directory, dynamically appends S3 parameters (`hive.s3.endpoint`, `hive.s3.aws-access-key`, `hive.s3.aws-secret-key`, `hive.s3.path-style-access`, `hive.s3.ssl.enabled`) derived from `.env`, and launches Presto with `--etc-dir /tmp/etc`. This keeps active credentials out of tracked configuration files while ensuring Presto can access MinIO directly. Note that Presto's Hudi connector is read-only.
 
-### `superset` — visualisation (optional)
+---
 
-On first boot installs `pyhive` and `presto-python-client` into its virtualenv, runs
-`superset db upgrade`, creates the admin user, runs `superset init`, and drops a `.initialized`
-marker into its volume so subsequent starts skip all of it. Nothing in the pipeline depends on
-Superset; it can be removed if you do not need dashboards.
+### 5. Ingestion & Storage Engine (`spark/`)
+
+#### `spark/spark-defaults.conf`
+* **Core Role:** Base configuration applied across all Spark applications initialized inside the `spark-client` container.
+* **Key Configuration Parameters:**
+  | Property | Configured Value | Technical Rationale |
+  | :--- | :--- | :--- |
+  | `spark.serializer` | `KryoSerializer` | High-efficiency binary serialization required by Hudi's index lookups and payload merging. |
+  | `spark.sql.catalogImplementation` | `hive` | Connects Spark SQL directly to the Hive Metastore catalog. |
+  | `spark.sql.hive.convertMetastoreParquet` | `false` | Disables Spark's default Parquet reader, forcing Spark to use Hudi's native input format so that commit timeline metadata and tombstone deletes are respected. |
+  | `spark.hadoop.hive.metastore.uris` | `thrift://hive-metastore:9083` | Network location of the Hive Metastore Thrift listener. |
+  | `spark.hadoop.fs.s3a.impl` | `S3AFileSystem` | Binds Hadoop's S3A filesystem client for MinIO object access. |
+  | `spark.hadoop.fs.s3a.aws.credentials.provider` | `EnvironmentVariableCredentialsProvider` | Automatically extracts AWS credentials from container environment variables. |
+  | `spark.jars.packages` | `hudi-spark3.5-bundle_2.12:0.15.0, hadoop-aws:3.3.4` | Pre-packages Hudi lakehouse and AWS S3 connectors on session start. |
+  | `spark.eventLog.enabled` | `true` | Records Spark application metrics to `/tmp/spark-events` for inspection in the Spark History Server. |
+
+#### `spark/github-ingest.properties`
+* **Core Role:** Supplies 18 operational table, index, sync, and lifecycle properties to `HoodieStreamer` via the `--props` CLI argument.
+* **Key Property Groups:**
+  * **Table Identity & Keys:**
+    * `hoodie.datasource.write.recordkey.field=id`: Maps GitHub's unique event identifier as Hudi's record primary key.
+    * `hoodie.datasource.write.precombine.field=created_at`: Conflict-resolution ordering field. If two incoming records share the same `id`, the record with the newer timestamp persists.
+    * `hoodie.datasource.write.partitionpath.field=type`: Partitions Parquet files into directories based on event type.
+    * `hoodie.datasource.write.hive_style_partitioning=true`: Writes directory paths using the standard `key=value/` format (`type=PushEvent/`), enabling Hive and Presto partition pruning.
+  * **Metastore Synchronization:**
+    * `hoodie.datasource.hive_sync.enable=true`: Automatically registers table metadata upon batch completion.
+    * `hoodie.datasource.hive_sync.mode=hms`: Synchronizes metadata directly over Thrift to the Hive Metastore (`thrift://hive-metastore:9083`) without requiring an intermediate HiveServer2 JDBC connection.
+    * `hoodie.datasource.hive_sync.database=default` & `.table=github_events`: Sets the destination schema and table name.
+  * **Schema Handling:**
+    * `hoodie.schema.on.read.enable=true` & `hoodie.datasource.write.reconcile.schema=true`: Enables dynamic schema evolution, allowing the table to accept additive non-breaking fields and nullable types without rewriting existing Parquet data files.
+  * **File Lifecycle & Compaction:**
+    * `hoodie.cleaner.commits.retained=5`: Retains the latest 5 commits in the timeline, supporting historical time-travel queries while automatically purging older file versions.
+    * `hoodie.clustering.inline=true` & `hoodie.clustering.inline.max.commits=4`: Runs inline clustering every 4 commits, combining small Parquet files into optimal 120 MB columnar chunks without needing external compaction daemons.
+  * **Schema Provider:**
+    * `hoodie.streamer.schemaprovider.class=FilebasedSchemaProvider`: Instructs `HoodieStreamer` to load the Avro contract from `/opt/spark/conf/github-schema.avsc`.
+
+#### `spark/github-schema.avsc`
+* **Core Role:** The formal Apache Avro schema contract governing record ingestion into the lakehouse table.
+* **Structural Architecture:**
+  * **8 Top-Level Envelope Fields:** Matches the GitHub Archive event envelope: `id` (string), `type` (string), `public` (boolean), `created_at` (string), and four record objects: `actor` (6 fields), `repo` (3 fields), `org` (5 fields), and `payload` (15 fields).
+  * **15-Field Payload Structure:** Holds 11 scalar fields (`action`, `ref`, `ref_type`, `master_branch`, `description`, `pusher_type`, `push_id`, `head`, `before`, `number`, `repository_id`) and 4 nested records (`issue`, `pull_request`, `comment`, `release`).
+  * **Polymorphic Nullability:** Every field is defined as a union with null (e.g., `["null", "string"]` with `"default": null`). This accommodates GitHub's polymorphic event structures (e.g., a `PushEvent` provides `push_id` and commit references, whereas an `IssuesEvent` provides `action` and issue records) without triggering schema validation errors.
+
+#### `spark/hudi_acid_superpowers_demo.py`
+* **Core Role:** A standalone PySpark script mounted inside the `spark-client` container for demonstrating Hudi's core lakehouse capabilities.
+* **Demonstrations Implemented:**
+  1. **ACID Upsert (In-Place Mutation):** Selects an existing record from the table, modifies its `created_at` timestamp to the current instant, and writes an update batch using `operation='upsert'`. Proves that Hudi mutates existing Parquet files without duplicating rows or requiring full-table rewrites.
+  2. **GDPR Point Delete ("Right to be Forgotten"):** Selects a specific `actor.login` and writes an `operation='delete'` batch targeting only that user's record keys. Demonstrates targeted compliance erasure on columnar object storage without rewriting unaffected partitions.
+  3. **Time Travel & Timeline Inspection:** Queries the Hudi commit timeline (`_hoodie_commit_time`) to inspect historical table states across past commit instants, proving reproducible point-in-time analytical historical querying.
 
 ---
 
@@ -763,9 +565,9 @@ docker exec -it spark-client /opt/spark/bin/spark-submit \
 *(Prerequisite: Requires at least one completed ingestion DAG run).*
 
 This interactive script executes three live demonstrations:
-1. ⚡ **ACID In-Place Upsert:** Selects an existing Issue or PR event and updates its timestamp. The record mutates in-place on storage without creating duplicates or requiring a full table rewrite.
-2. 🔒 **GDPR Point Delete ("Right to be Forgotten"):** Selects an active user login and permanently purges all associated activity records by primary key without rewriting unaffected files.
-3. 🕒 **Time Travel Inspection:** Reads Hudi's `.hoodie/` timeline to list active commit instants and display data states across historical points in time.
+1. **ACID In-Place Upsert:** Selects an existing Issue or PR event and updates its timestamp. The record mutates in-place on storage without creating duplicates or requiring a full table rewrite.
+2. **GDPR Point Delete ("Right to be Forgotten"):** Selects an active user login and permanently purges all associated activity records by primary key without rewriting unaffected files.
+3. **Time Travel Inspection:** Reads Hudi's `.hoodie/` timeline to list active commit instants and display data states across historical points in time.
 
 ---
 

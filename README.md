@@ -63,7 +63,7 @@ Everything else below is verified against the running stack.
 ## How the pipeline works
 
 <p align="center">
-  <img src="images/pipeline_flow.png" alt="Pipeline Flow Diagram" width="85%" />
+  <img src="images/pipeline_flow.png" alt="Pipeline Flow Diagram" width="100%" />
 </p>
 
 Task dependency is strictly linear: `download → ingest → quality gate`. A failure at any step

@@ -21,8 +21,8 @@ This is a **learning and demonstration platform**, not a production deployment. 
 - Every credential defaults to a well-known value (`admin`/`admin`, `minioadmin`/`minioadmin`).
 - There is no authentication, TLS, or authorisation on any endpoint.
 - Ingestion is **batch only**. There is no streaming or CDC path.
-- The Avro schema is **fixed**, not self-evolving — see
-  [Schema handling](#schema-handling-important) for exactly what that means.
+- The Avro schema is **contract-driven** — see
+  [Schema management & evolution](#schema-management--evolution) for details on schema handling.
 
 Everything else below is verified against the running stack.
 
@@ -31,13 +31,14 @@ Everything else below is verified against the running stack.
 ## Table of contents
 
 - [Technology stack](#technology-stack)
+- [What is Apache Hudi?](#what-is-apache-hudi)
 - [How the pipeline works](#how-the-pipeline-works)
 - [Repository layout](#repository-layout)
 - [File-by-file reference](#file-by-file-reference)
 - [Service-by-service reference](#service-by-service-reference)
 - [Persistent volumes](#persistent-volumes)
 - [Environment variables](#environment-variables)
-- [Schema handling](#schema-handling-important)
+- [Schema management & evolution](#schema-management--evolution)
 - [Quickstart](#quickstart)
 - [Operating the platform](#operating-the-platform)
 - [Design decisions explained](#design-decisions-explained)
@@ -57,6 +58,35 @@ Everything else below is verified against the running stack.
 | **Query engine** | [PrestoDB](https://prestodb.io/) | `0.299` | Distributed MPP SQL engine — one coordinator plus two workers, on OpenJDK 17. Reads Hudi tables through the metastore. **Read-only** for this connector. |
 | **Orchestrator** | [Apache Airflow](https://airflow.apache.org/) | `2.7.2` (Python 3.9) | Schedules extraction, triggers the Spark job, runs the data-quality gate, and fires Slack alerts on failure. |
 | **Visualisation** | [Apache Superset](https://superset.apache.org/) | `6.1.0` | Optional BI layer. Connects to Presto over the `pyhive` SQLAlchemy dialect. |
+
+---
+
+## What is Apache Hudi?
+
+[Apache Hudi](https://hudi.apache.org/) (pronounced *"hoodie"*, originally created at Uber and an acronym for **H**adoop **U**pserts **D**eletes and **I**ncrementals) is an open-source **transactional data lakehouse table format**. It manages how data files (specifically [Apache Parquet](https://parquet.apache.org/)) are stored, mutated, and cataloged on distributed object storage such as AWS S3 or MinIO.
+
+### The problem Hudi solves
+
+In traditional data lakes, cloud storage stores raw, immutable flat files. That creates fundamental data engineering challenges:
+
+- **No row-level updates or deletes:** Updating or deleting a single record requires reading, rewriting, and replacing an entire partition directory or table.
+- **No transactional guarantees (ACID):** Concurrent writes risk corrupting readers, and failed pipeline runs leave uncommitted, orphaned files scattered across storage.
+- **Costly privacy compliance:** Fulfilling GDPR/CCPA "Right to be Forgotten" requests requires expensive full-table rewrites.
+- **The small-file problem:** Frequent batch or streaming ingestion creates millions of tiny Parquet files that overwhelm object store metadata and degrade SQL query performance.
+
+Hudi bridges the gap between traditional data warehouses (fast updates, ACID guarantees) and cloud data lakes (cheap, scalable, open file formats) to create a **Lakehouse**.
+
+### Core concepts in this project
+
+| Concept | What it means | How this repository uses it |
+| :--- | :--- | :--- |
+| **ACID Transactions** | Atomic commits; writes succeed completely or rollback cleanly with zero reader interference. | Every batch ingested by `HoodieStreamer` commits atomically to MinIO. |
+| **Record Key (`recordkey.field`)** | A unique primary key per record. | Mapped to `id` (the GitHub event ID). |
+| **Precombine Key (`precombine.field`)** | An ordering field used to resolve conflicts when duplicate primary keys arrive. | Mapped to `created_at`. If two events share the same `id`, the record with the newer timestamp automatically wins. |
+| **Commit Timeline (`.hoodie/`)** | An immutable transaction log tracking all commits, cleans, compactions, and rollbacks. | Stored alongside Parquet files in MinIO. Powers **time travel** and snapshot isolation for Presto queries. |
+| **Table Type: Copy-on-Write (COW)** | Updates rewrite only the specific Parquet files containing modified rows. | Zero merge overhead for readers — Presto queries run against pure columnar Parquet at maximum speed. |
+| **Hive-Style Partitioning** | Directories formatted as `key=value/`. | Events partition into `type=PushEvent/`, `type=PullRequestEvent/`, etc., allowing Presto to prune unused partitions instantly. |
+| **Inline Clustering & Cleaning** | Automatically combines small files into optimal chunks and purges obsolete file slices. | Keeps 5 commits of history for time travel and clusters files every 4 commits without running background daemons. |
 
 ---
 
@@ -537,147 +567,192 @@ Then stop the `minio` and `minio-init` services — the bucket must already exis
 
 ---
 
-## Schema handling (important)
+## Schema management & evolution
 
-`github-schema.avsc` is applied through `FilebasedSchemaProvider`, which means the schema is
-**fixed, not self-evolving**. Hudi reads each JSON line and maps it onto this Avro schema; **any
-field not declared here is silently dropped.** If GitHub adds a new payload field, it will not
-appear in your table until you add it to the `.avsc` yourself.
+This lakehouse enforces a **contract-driven schema** using Apache Avro (`spark/github-schema.avsc`) and Hudi's `FilebasedSchemaProvider`.
 
-The properties `hoodie.schema.on.read.enable` and `hoodie.datasource.write.reconcile.schema` govern
-how the *target table* reconciles against an incoming batch — they do **not** make the source schema
-dynamic.
+---
 
-### Changing the schema
+### How schema enforcement works
 
-Some edits are incompatible with an existing table — removing a field, or changing a `struct` to a
-`string`. Hive rejects those outright
-(`hive.metastore.disallow.incompatible.col.type.changes` defaults to `true`), and the failure
-surfaces *after* Spark has finished all its work, during metastore sync.
+1. **Explicit Schema Contract:** Every incoming JSON event from GitHub Archive is mapped onto `github-schema.avsc`. Any raw JSON fields not defined in this Avro schema are safely filtered out during ingestion.
+2. **Table-Level Evolution:** When new columns are added to the Avro schema, Hudi's `hoodie.schema.on.read.enable=true` and `hoodie.datasource.write.reconcile.schema=true` automatically reconcile incoming batches against historical commits. Older files return `NULL` for newly added fields without requiring table rewrites.
 
-For an incompatible change, drop the table first — the `.avsc` edit alone will not take effect:
+---
 
+### Schema change compatibility matrix
+
+| Change Type | Example | In-Place Evolution? | Action Required |
+| :--- | :--- | :---: | :--- |
+| **Add nullable field** | Adding a new field to `payload` (e.g. `reactions`) | **Yes (Safe)** | Add the field to `github-schema.avsc` with `default: null`. Next DAG run applies it automatically. |
+| **Widen data type** | Promoting `int` to `long` | **Yes (Safe)** | Update type in `github-schema.avsc`. Hudi reconciles the promotion on read. |
+| **Incompatible change** | Renaming/deleting fields, changing `struct` to `string` | **No (Breaking)** | Hive Metastore rejects incompatible types to protect catalog integrity. Requires a table recreation. |
+
+---
+
+### Applying breaking (incompatible) schema changes
+
+If you make a breaking schema change (such as altering nested struct hierarchies or removing existing columns), recreate the table definition using this 3-step workflow:
+
+#### Step 1: Drop the catalog registration in Spark SQL
+The table is registered as `EXTERNAL`, so dropping it removes only the Hive catalog entry — raw data files remain safe:
 ```bash
-# 1. Remove the metastore registration.
-#    The table is EXTERNAL, so this drops only the catalog entry — no data files are deleted.
 docker exec spark-client /opt/spark/bin/spark-sql \
   --master "local[2]" --driver-memory 1G \
   -e "DROP TABLE IF EXISTS default.github_events;"
-
-# 2. Delete the Hudi files, which also resets Hudi's ingestion checkpoint
-#    (MinIO Console → github-raw-data → delete the hudi-tables/ prefix)
-
-# 3. Re-trigger the DAG
 ```
+*(Use `spark-sql` rather than `presto-cli`, as the Presto Hudi connector is read-only).*
 
-Use `spark-sql`, not `presto-cli` — the Presto Hudi connector cannot execute `DROP TABLE`.
+#### Step 2: Delete existing Hudi storage files
+In the **[MinIO Console](http://localhost:9001)** (`minioadmin` / `minioadmin`), navigate to the `github-raw-data` bucket and delete the `hudi-tables/` prefix. This purges old Parquet files and resets Hudi's commit checkpoint.
 
-Adding new nullable fields is compatible and needs no drop.
+#### Step 3: Re-trigger the ingestion DAG
+Trigger the pipeline via the [Airflow UI](http://localhost:8085) or run:
+```bash
+docker exec airflow airflow dags trigger github_events_ingestion
+```
+Spark will ingest the raw staging data under your new schema and register fresh table metadata in the Hive Metastore.
 
 ---
 
 ## Quickstart
 
+Get the entire lakehouse platform up and running in under 5 minutes.
+
+---
+
 ### Prerequisites
 
-- Docker Engine 24.0+ and Docker Compose 2.20+
-- **Docker memory allocation of at least 16 GB** (Docker Desktop → Settings → Resources → Memory).
-  Spark's driver alone requests 6 GB and the three Presto nodes can each reach 3 GB. If you only
-  need the pipeline, remove `presto-worker-2` and `superset` to cut roughly 2 GB.
-- ~5 GB free disk for images plus room for ingested data (one day ≈ 750 MB).
+* **Docker & Docker Compose:** Docker Engine 24.0+ and Docker Compose 2.20+
+* **Memory Allocation:** At least **16 GB RAM** allocated to Docker (Docker Desktop → Settings → Resources → Memory)
+* **Disk Space:** ~10 GB free disk space for images and local data
 
-### 1. Configure
+---
+
+### 1. Configure environment
+
+Copy the pre-configured environment template:
 
 ```bash
 cp .env.example .env
 ```
+*(Default values work out-of-the-box for local MinIO object storage. Optionally set `SLACK_WEBHOOK_URL` for alerts).*
 
-The defaults work as-is against local MinIO. Optionally set `SLACK_WEBHOOK_URL` for failure alerts.
+---
 
-### 2. Launch
+### 2. Start the platform
+
+Launch all 10 services in the background:
 
 ```bash
 docker compose up -d
 ```
 
-First run pulls ~6 GB of images and resolves Hudi JARs in the background; allow several minutes.
+> **Note:** Initial startup downloads container images (~6 GB) and pre-warms Hudi's dependency cache. Allow 2–3 minutes for all containers to reach a healthy state.
 
-### 3. Verify
+---
+
+### 3. Verify & access web interfaces
+
+Confirm container health:
 
 ```bash
 docker compose ps
 ```
+*(All core services will report `healthy` or `running`. The helper `minio-init` container will show `Exited (0)`, which is expected).*
 
-Expect `healthy` for `minio`, `mysql-db`, `hive-metastore`, `presto-server`, and `superset`;
-`running` for `presto-worker-1`, `presto-worker-2`, `spark-client`, and `airflow`; and
-**`Exited (0)` for `minio-init`, which is correct**.
+Once services are healthy, access the web interfaces directly in your browser:
 
-```bash
-curl -s -o /dev/null -w "MinIO:          %{http_code}\n" http://localhost:9000/minio/health/live
-curl -s -o /dev/null -w "Presto:         %{http_code}\n" http://localhost:8080/v1/info
-curl -s -o /dev/null -w "Spark History:  %{http_code}\n" http://localhost:18080/
-curl -s -o /dev/null -w "Airflow:        %{http_code}\n" http://localhost:8085/health
-curl -s -o /dev/null -w "Superset:       %{http_code}\n" http://localhost:8088/health
-```
+| Service / Interface | URL | Credentials | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Airflow Webserver** | [http://localhost:8085](http://localhost:8085) | `admin` / `admin` | Trigger and monitor ingestion DAG runs |
+| **MinIO Console** | [http://localhost:9001](http://localhost:9001) | `minioadmin` / `minioadmin` | Inspect raw staging bucket and Hudi table files |
+| **Apache Superset** | [http://localhost:8088](http://localhost:8088) | `admin` / `admin` | SQL Lab queries, metrics, and BI dashboards |
+| **Spark History Server** | [http://localhost:18080](http://localhost:18080) | *(No auth)* | Review completed Spark `HoodieStreamer` job runs |
+| **Presto Coordinator** | [http://localhost:8080](http://localhost:8080) | *(No auth)* | Cluster status, active queries, and worker nodes |
 
-All five should return `200`.
+👉 Next step: Proceed to **[Operating the platform](#operating-the-platform)** to trigger your first ingestion run.
 
 ---
 
 ## Operating the platform
 
-### Run the pipeline
+A complete step-by-step workflow: from triggering ingestion and running interactive SQL queries, to demonstrating Hudi's ACID superpowers and building dashboards.
+
+---
+
+### 1. Ingest data via Airflow
+
+Trigger the automated 3-task pipeline (`download → ingest → quality gate`):
 
 ```bash
 docker exec airflow airflow dags unpause github_events_ingestion
 docker exec airflow airflow dags trigger github_events_ingestion
 ```
 
-Or use the UI at http://localhost:8085. Watch the Spark job at http://localhost:4040 while it runs,
-and review it afterwards at http://localhost:18080.
+* **Web UI:** Monitor execution in real time at [http://localhost:8085](http://localhost:8085) (`admin` / `admin`).
+* **Spark Live Progress:** While Task 2 is running, watch executors and stages at [http://localhost:4040](http://localhost:4040).
+* **Spark History:** Review completed job metrics afterwards at [http://localhost:18080](http://localhost:18080).
 
-A full day is roughly 1.5 million events across 16 event-type partitions. Download dominates the
-runtime.
+> **Runtime note:** A full 24-hour batch processes ~1.5 million GitHub events across 16 event-type partitions. Downloading raw archives from GitHub dominates the runtime.
 
-### Query with Presto
+---
+
+### 2. Query the lakehouse with Presto
+
+Launch the interactive Presto CLI connected to the Hudi catalog:
 
 ```bash
 docker exec -it presto-server presto-cli --catalog hudi --schema default
 ```
 
+#### A. Discover tables & partition distribution
 ```sql
 SHOW TABLES;
 
--- Event volume by partition
+-- Event volume by partition (demonstrating partition pruning)
 SELECT type, count(*) AS events
 FROM github_events
 GROUP BY type
 ORDER BY events DESC;
+```
 
--- Typed access into the nested payload
+#### B. Query deep nested JSON / Avro structures
+Because the table is backed by a strongly-typed Avro schema, nested attributes query with standard SQL dot-notation:
+
+```sql
+-- Extract git commit details from push events
 SELECT payload.push_id, payload.ref, payload.head
 FROM github_events
 WHERE type = 'PushEvent'
 LIMIT 5;
 
--- Pull-request branches, from the nested head/base records
+-- Extract source and target branches from pull requests
 SELECT payload.pull_request.number,
        payload.pull_request.head.ref AS source_branch,
        payload.pull_request.base.ref AS target_branch
 FROM github_events
 WHERE type = 'PullRequestEvent'
 LIMIT 5;
+```
 
--- The Hudi commit timeline
+#### C. Inspect Hudi's ACID commit timeline
+Query Hudi's internal metadata column `_hoodie_commit_time` to inspect historical write batches:
+
+```sql
 SELECT _hoodie_commit_time, count(*) AS rows
 FROM github_events
 GROUP BY _hoodie_commit_time
 ORDER BY _hoodie_commit_time DESC;
 ```
 
-Remember: this catalog is **read-only**. Use Spark for any write.
+> **Note:** The Presto Hudi connector is **read-only** (`SELECT` queries only). DDL/DML write operations (`INSERT`, `UPDATE`, `DROP`) are managed via Apache Spark.
 
-### Run the ACID demo
+---
+
+### 3. Run the Hudi ACID superpowers demo
+
+Run the bundled PySpark demonstration script to witness Hudi's lakehouse capabilities in action:
 
 ```bash
 docker exec -it spark-client /opt/spark/bin/spark-submit \
@@ -685,113 +760,159 @@ docker exec -it spark-client /opt/spark/bin/spark-submit \
   /opt/spark/hudi_acid_superpowers_demo.py
 ```
 
-Requires an already-populated table.
+*(Prerequisite: Requires at least one completed ingestion DAG run).*
 
-### Connect Superset
+This interactive script executes three live demonstrations:
+1. ⚡ **ACID In-Place Upsert:** Selects an existing Issue or PR event and updates its timestamp. The record mutates in-place on storage without creating duplicates or requiring a full table rewrite.
+2. 🔒 **GDPR Point Delete ("Right to be Forgotten"):** Selects an active user login and permanently purges all associated activity records by primary key without rewriting unaffected files.
+3. 🕒 **Time Travel Inspection:** Reads Hudi's `.hoodie/` timeline to list active commit instants and display data states across historical points in time.
 
-1. Open http://localhost:8088 (`admin` / `admin`).
-2. **Settings → Database Connections → + Database → Presto**.
-3. SQLAlchemy URI: `presto://superset@presto-server:8080/hudi/default`
-4. **Test connection**, then **Connect**, then use **SQL Lab**.
+---
+
+### 4. Visualize data in Apache Superset
+
+Connect Superset to Presto to create charts and dashboards:
+
+1. Open **[http://localhost:8088](http://localhost:8088)** in your browser (`admin` / `admin`).
+2. Navigate to **Settings** (top right) → **Database Connections** → **+ Database**.
+3. Select **Presto** from the database dropdown.
+4. Enter the internal Docker SQLAlchemy URI:
+   ```text
+   presto://superset@presto-server:8080/hudi/default
+   ```
+5. Click **Test connection** (expect a green success message), then click **Connect**.
+6. Open **SQL Lab → SQL Editor**, select the `hudi` catalog and `default` schema, and start querying.
 
 ---
 
 ## Design decisions explained
 
+The engineering rationale, trade-offs, and production context behind key architectural choices.
+
+---
+
 ### Why `local[4]` and 6 GB of driver memory?
 
-GitHub Archive ships **non-splittable** `.json.gz` files, so each file becomes exactly one Spark
-partition, and gzip inflates roughly tenfold in memory. With `--master local[*]` on a 12-core host,
-Spark inflates 12 files concurrently **inside a single driver JVM** — which reliably exhausted a
-3 GB heap with `java.lang.OutOfMemoryError: Java heap space`.
+* **The Decision:** Run Spark with `--master local[4]` and `--driver-memory 6G` rather than default `--master local[*]`.
+* **The Problem:** GitHub Archive files are `.json.gz` (compressed gzip). Gzip files are **non-splittable** — each file must be decompressed as a single stream, inflating roughly **10x in RAM**. On a modern 8- or 12-core machine, default Spark (`local[*]`) attempts to decompress 8 to 12 files simultaneously in a single JVM, causing immediate `OutOfMemoryError: Java heap space`.
+* **Why this works:** Capping concurrency at 4 (`local[4]`) limits simultaneous file inflations to 4 at a time, while 6 GB provides ample heap headroom for Hudi's sorting and indexing.
+* **Key Takeaway:** In Spark local mode, there are no worker executors. All tasks run inside the driver JVM, meaning only `--driver-memory` has an effect (`--executor-memory` is ignored).
 
-`local[4]` cuts peak concurrent inflation by about two thirds, and 6 GB gives the remaining four
-partitions headroom. Note that `--executor-memory` is meaningless here: in local mode there are no
-executors, so only `--driver-memory` has any effect.
+---
 
 ### Why Copy-on-Write rather than Merge-on-Read?
 
-COW rewrites Parquet files at write time, so readers never merge log files — Presto queries are
-fast and need no compaction awareness. MOR would favour write latency instead, which does not matter
-for a daily batch.
+* **The Decision:** Configure Hudi as `COPY_ON_WRITE` (`--table-type COPY_ON_WRITE`).
+* **The Trade-off:**
+  | Table Type | Write Speed | Query / Read Speed | Ideal Workload |
+  | :--- | :--- | :--- | :--- |
+  | **Copy-on-Write (COW)** *(Chosen)* | Slower (rewrites Parquet files on update) | **Fastest** (pure columnar Parquet reads) | Analytical queries, BI dashboards, batch jobs |
+  | **Merge-on-Read (MOR)** | Fastest (appends updates to delta Avro logs) | Slower (readers must merge base + delta files) | High-frequency streaming / real-time CDC |
+* **Why this works:** This pipeline ingests in hourly/daily batches and serves interactive SQL queries to Presto and Superset. Optimizing for **blazing-fast read speed** is far more valuable than write latency. Presto queries plain Parquet files directly with zero merge overhead.
+
+---
 
 ### Why partition by `type`?
 
-It makes partition pruning easy to demonstrate and maps cleanly to 16 event types. Be aware it is
-**heavily skewed**: `PushEvent` accounts for roughly 80–90% of all events depending on the hour, so
-that single partition dominates every batch and every inline clustering pass. Production workloads
-would normally partition by ingestion date instead.
+* **The Decision:** Store events in directories partitioned by event type (`type=PushEvent/`, `type=PullRequestEvent/`).
+* **Why this works:** It makes **partition pruning** easy to demonstrate in SQL. When a query includes `WHERE type = 'PushEvent'`, Presto skips all other partition folders and only reads the relevant Parquet files.
+* **Production Reality:** In real-world enterprise deployments, event data is almost always partitioned by **ingestion date** (`year=.../month=.../day=...`). GitHub events are heavily skewed — `PushEvent` accounts for ~85% of all events, creating uneven partition sizes. Date partitioning guarantees evenly distributed file sizes across object storage.
+
+---
 
 ### Why does Airflow use the Docker socket instead of a Spark operator?
 
-Mounting `/var/run/docker.sock` and calling `docker exec` keeps Airflow free of Spark, Hudi, and
-Hadoop JARs — Spark dependencies stay entirely inside `spark-client`. The trade-off is that Airflow
-gains host-level Docker access, which is fine locally and unsafe in shared environments.
+* **The Decision:** Airflow mounts `/var/run/docker.sock` and triggers `spark-submit` inside the `spark-client` container via `docker exec`.
+* **The Problem:** Using Airflow's built-in `SparkSubmitOperator` requires bundling Java, Spark binaries, and ~150 MB of Hudi/Hadoop JAR dependencies directly into the Airflow container image.
+* **Why this works:** Keeping Spark dependencies isolated inside `spark-client` keeps Airflow lightweight, fast to boot, and free of Java/Hadoop library conflicts.
+* **Production Note:** Mounting the Docker socket grants host-level container control to Airflow. This is safe and convenient for local development, but in a production cloud environment, you would use a remote API such as Apache Livy or the Kubernetes Spark Operator.
+
+---
 
 ### Why is there a "Nothing to commit" circuit breaker?
 
-Hudi exits `0` when it finds no new source files. Without the check, a retry after a failed
-ingestion would find the checkpoint already advanced, do nothing, and mark the task **green** — a
-silent false success that also lets the quality gate validate a stale commit. The DAG therefore
-treats that log line as a hard failure.
+* **The Decision:** Fail the ingestion task if Spark output contains `"Nothing to commit"`.
+* **The Problem:** If no new raw files exist on MinIO (or if a previous run already consumed them), Hudi exits with code `0` (Success) without writing any new rows.
+* **Why this works:** Without this check, Airflow would see exit code `0`, mark the task **green**, and proceed to validate stale data from a previous commit. The circuit breaker catches this silent false-success and raises an alert.
 
 ---
 
 ## Troubleshooting
 
-### `minio-init` shows as exited
+Common issues, root causes, and step-by-step resolutions.
 
-Correct behaviour. It creates the bucket and exits `0`. Check `docker logs minio-init` for
-`MinIO storage initialized successfully`.
+---
 
-### `Table hudi.default.github_events does not exist`
+### 1. Containers & Startup
 
-The pipeline has not completed a successful ingestion yet. Run the DAG. If a run reported success but
-the table is absent, check the `trigger_hudi_ingestion` log for `Nothing to commit`.
+#### `minio-init` container status is `Exited (0)`
+* **Explanation:** Normal behaviour. `minio-init` is a one-shot setup container that creates the `github-raw-data` bucket on MinIO, prints a confirmation, and exits cleanly.
+* **Verification:** Run `docker logs minio-init` to confirm `MinIO storage initialized successfully`.
+* **Technical Note:** Airflow declares `depends_on: { minio-init: { condition: service_completed_successfully } }`, so it waits for this container to exit with code `0` before starting the scheduler.
 
-### `Hoodie table not found in path …/.hoodie`
+#### Metastore fails with `Table 'metastore_db.DBS' doesn't exist`
+* **Cause:** Hive Metastore started before its MySQL database finished creating the catalog tables.
+* **Resolution:** Re-run the metastore's schema initialization tool:
+  ```bash
+  docker exec hive-metastore /opt/hive/bin/schematool -dbType mysql -initSchema
+  ```
+* **Technical Note:** The container entrypoint executes `schematool -dbType mysql -info || schematool -dbType mysql -initSchema`. If MySQL was interrupted during first initialization, triggering `schematool` manually restores the 74 metadata tables.
 
-The metastore holds a table registration but the underlying Hudi files are gone — usually from
-deleting `hudi-tables/` without dropping the table. Drop the table (see
-[Changing the schema](#changing-the-schema)) and re-ingest.
+---
 
-### Spark fails with `OutOfMemoryError`
+### 2. Ingestion & Pipeline Issues
 
-Lower `--source-limit` in `trigger_spark_ingestion` (try `268435456` for 256 MB), reduce `local[4]`
-to `local[2]`, or raise Docker's memory allocation. Confirm what actually ran via
-`http://localhost:18080` → application → **Environment**.
+#### Presto error: `Table hudi.default.github_events does not exist`
+* **Cause:** The table has not been created yet because the Airflow pipeline has not run.
+* **Resolution:** Trigger the DAG via the [Airflow UI](http://localhost:8085) (`admin`/`admin`) or run:
+  ```bash
+  docker exec airflow airflow dags trigger github_events_ingestion
+  ```
+* **Technical Note:** If the DAG reported success but the table is still missing, inspect the `trigger_hudi_ingestion` task logs for `"Nothing to commit"`. This indicates no raw `.json.gz` files were found in `s3://github-raw-data/github-raw/`.
 
-### Presto query fails with an S3 error
+#### Spark job fails with `OutOfMemoryError: Java heap space`
+* **Cause:** Spark exceeded driver heap memory while extracting and parsing large compressed GitHub event files.
+* **Resolution (choose one):**
+  1. **Allocate more RAM (Recommended):** In Docker Desktop → Settings → Resources, allocate at least **16 GB** memory.
+  2. **Reduce concurrency:** In `airflow/dags/github_ingestion_dag.py`, change `--master local[4]` to `--master local[2]` to cut concurrent partition inflation in half.
+  3. **Lower batch limit:** In `airflow/dags/github_ingestion_dag.py`, reduce `--source-limit` to `268435456` (256 MB).
+* **Technical Note:** GitHub Archive `.json.gz` files are non-splittable, so each file becomes one Spark partition. Local mode runs all tasks in a single driver JVM. You can inspect actual executor memory usage at `http://localhost:18080` → application → **Environment**.
 
-Check that the injected credentials landed:
+#### Airflow web UI lost previous DAG run history
+* **Cause:** Running `docker compose down -v` deletes Docker storage volumes, including `airflow-data` where SQLite stores run history.
+* **Resolution:** To stop containers without losing run history or ingested tables, run `docker compose down` (without the `-v` flag).
 
-```bash
-docker exec presto-server cat /tmp/etc/catalog/hudi.properties
-```
+---
 
-You should see `hive.s3.endpoint`, `hive.s3.aws-access-key`, `hive.s3.aws-secret-key`,
-`hive.s3.path-style-access`, and `hive.s3.ssl.enabled` appended below the two static lines. If they
-are missing, the container started before `.env` was readable — recreate it.
+### 3. Querying & Storage
 
-### Metastore fails with `Table 'metastore_db.DBS' doesn't exist`
+#### Presto error: `Hoodie table not found in path …/.hoodie`
+* **Cause:** Hive Metastore remembers that the table exists, but the physical data files in MinIO storage were deleted.
+* **Resolution:** Drop the orphaned catalog entry using Spark SQL, then re-run the pipeline:
+  ```bash
+  docker exec spark-client /opt/spark/bin/spark-sql \
+    --master "local[2]" --driver-memory 1G \
+    -e "DROP TABLE IF EXISTS default.github_events;"
+  ```
+* **Technical Note:** The table is an `EXTERNAL` table. Deleting storage files leaves the metastore out of sync. Because the Presto Hudi connector is read-only, `DROP TABLE` DDL must be submitted through Spark SQL.
 
-Schema initialisation did not run. Verify manually:
+#### Presto query fails with an S3 Authentication / Access Denied error
+* **Cause:** Presto cannot communicate with MinIO storage, usually because `.env` was missing or modified after the container started.
+* **Resolution:** Check that Presto received the active credentials:
+  ```bash
+  docker exec presto-server cat /tmp/etc/catalog/hudi.properties
+  ```
+  You should see `hive.s3.endpoint`, `hive.s3.aws-access-key`, and `hive.s3.aws-secret-key`. If missing, recreate the Presto cluster:
+  ```bash
+  docker compose restart presto-server presto-worker-1 presto-worker-2
+  ```
+* **Technical Note:** Presto's entrypoint dynamically copies read-only mounted files to `/tmp/etc` and appends `hive.s3.*` credentials from environment variables before launching.
 
-```bash
-docker exec hive-metastore /opt/hive/bin/schematool -dbType mysql -info
-```
+---
 
-### Airflow forgot all my DAG runs
+### 4. Platform Resets
 
-Run history lives in the `airflow-data` volume. `docker compose down -v` deletes it; plain
-`docker compose down` does not.
-
-### Full reset
-
-```bash
-docker compose down -v     # deletes ALL volumes, including every ingested row
-docker compose up -d
-```
-
-For a data-only reset, delete `hudi-tables/` in the MinIO Console and drop the metastore table
-instead — that keeps images, the Ivy cache, and Airflow history intact.
+| Reset Type | Command / Action | What gets deleted | What is preserved |
+| :--- | :--- | :--- | :--- |
+| **Data-Only Reset** *(Recommended)* | 1. In [MinIO Console](http://localhost:9001), delete `hudi-tables/`<br>2. Run `DROP TABLE IF EXISTS default.github_events;` in Spark | Ingested Hudi tables and raw data batches | Docker images, Ivy JAR cache, Airflow DAG history |
+| **Factory Reset** *(Clean Slate)* | `docker compose down -v`<br>`docker compose up -d` | **Everything** — all 6 volumes, tables, users, and logs | Nothing (fresh initial state) |

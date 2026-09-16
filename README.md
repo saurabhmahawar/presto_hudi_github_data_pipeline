@@ -1,4 +1,4 @@
-# Data Lakehouse on Docker: Presto · Apache Hudi · MinIO
+# GitHub Event Lakehouse: PrestoDB · Apache Hudi · MinIO · Airflow
 
 A self-contained **data lakehouse** that runs entirely in Docker. It ingests the public
 [GitHub Archive](https://www.gharchive.org/) event firehose into ACID-transactional

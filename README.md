@@ -32,12 +32,8 @@ Everything else below is verified against the running stack.
 
 - [Technology stack](#technology-stack)
 - [What is Apache Hudi?](#what-is-apache-hudi)
-- [How the pipeline works](#how-the-pipeline-works)
 - [Repository layout](#repository-layout)
 - [File-by-file reference](#file-by-file-reference)
-- [Service-by-service reference](#service-by-service-reference)
-- [Persistent volumes](#persistent-volumes)
-- [Environment variables](#environment-variables)
 - [Schema management & evolution](#schema-management--evolution)
 - [Quickstart](#quickstart)
 - [Operating the platform](#operating-the-platform)
@@ -90,17 +86,6 @@ Hudi bridges the gap between traditional data warehouses (fast updates, ACID gua
 
 ---
 
-## How the pipeline works
-
-<p align="center">
-  <img src="images/pipeline_flow.png" alt="Pipeline Flow Diagram" width="100%" />
-</p>
-
-Task dependency is strictly linear: `download → ingest → quality gate`. A failure at any step
-stops the run and triggers the Slack callback.
-
----
-
 ## Repository layout
 
 ```text
@@ -112,8 +97,7 @@ presto-hudi-cos/
 ├── docker-compose.yml                    # Defines all 10 services, 6 volumes, and 1 network
 │
 ├── images/
-│   ├── lakehouse_architecture.png        # Architecture diagram used above
-│   └── pipeline_flow.png                 # Pipeline flow diagram
+│   └── lakehouse_architecture.png        # Architecture diagram used above
 │
 ├── airflow/
 │   └── dags/
@@ -156,16 +140,17 @@ This guide provides a comprehensive technical breakdown of every repository file
   * **Health-Gated Startup Sequences:** Instead of unreliable fixed startup delays, dependent containers declare explicit `condition: service_healthy` checks. For example, the Hive Metastore waits for MySQL to accept TCP connections, Presto waits for the Hive Metastore Thrift port, and Airflow waits for `minio-init` to exit with code `0`.
   * **Decoupled Dynamic Configuration:** Several container images require parameters populated from `.env`. Container entrypoints interpolate live environment variables into runtime configuration paths (such as `/tmp/etc` in Presto and `/opt/hive/conf` in Hive Metastore) on boot, preventing hardcoded credentials in tracked files.
   * **Reusable YAML Anchors:** The `x-presto-entrypoint: &presto-entrypoint` anchor defines Presto's entrypoint script once at the file root and injects it across `presto-server`, `presto-worker-1`, and `presto-worker-2`.
-  * **State Persistence:** Dedicated Docker volumes (`minio-data`, `mysql-data`, `airflow-postgres-data`, `superset-data`, `spark-events`, `presto-data`) ensure that raw objects, metadata schemas, DAG run histories, and query logs survive container restarts.
+  * **State Persistence:** Dedicated Docker volumes (`minio-data`, `mysql-data`, `airflow-data`, `airflow-logs`, `spark-ivy-cache`, `superset-data`) ensure that raw objects, metadata schemas, DAG run histories, task execution logs, resolved Ivy dependencies, and dashboards survive container restarts.
 
 #### `.env.example` / `.env`
 * **Core Role:** Centralized configuration management defining the 11 environment variables shared across all 10 services.
 * **Key Variable Groups:**
-  * **Object Storage & S3:** `S3_ENDPOINT` (`minio:9000`), `S3_BUCKET_NAME` (`github-raw-data`), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (`us-east-1`), `S3_PATH_STYLE_ACCESS` (`true`), `S3_SSL_ENABLED` (`false`).
-  * **Metastore Database:** `MYSQL_ROOT_PASSWORD`, `MYSQL_PASSWORD` (`hivepass`).
+  * **Object Storage & S3:** `S3_ENDPOINT` (`http://minio:9000`), `S3_BUCKET_NAME` (`github-raw-data`), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (`us-east-1`), `S3_PATH_STYLE_ACCESS` (`true`), `S3_SSL_ENABLED` (`false`).
+  * **Metastore Database:** `MYSQL_ROOT_PASSWORD` (`rootpassword`), `MYSQL_PASSWORD` (`hivepassword`).
   * **Web UI Security:** `SUPERSET_SECRET_KEY` (used for session signing and CSRF tokens).
   * **Observability:** `SLACK_WEBHOOK_URL` (optional incoming webhook endpoint for pipeline failure alerts).
 * **Operational Note:** `.env.example` is tracked in version control as a documented baseline. Copy it to `.env` (which is git-ignored) before initial deployment.
+* **Cloud Portability:** To point the lakehouse to AWS S3 or Backblaze B2 instead of local MinIO, update `S3_ENDPOINT`, set `S3_PATH_STYLE_ACCESS=false`, and set `S3_SSL_ENABLED=true` in `.env` without changing any pipeline code (stop `minio` and `minio-init`; ensure the target bucket already exists remotely).
 
 ---
 
@@ -188,7 +173,7 @@ This guide provides a comprehensive technical breakdown of every repository file
      * **Circuit Breaker:** Streams Spark execution logs in real-time. If Hudi reports `"Nothing to commit"`, the task raises an explicit `RuntimeError` to prevent false-positive pipeline successes when zero new records were ingested.
 
   3. **`run_data_quality_assertions` (Task 3):**
-     * **Execution Logic:** Connects to the Presto coordinator over PyHive DB-API (`port 8080`) and determines the newest batch commit timestamp using `SELECT max(_hoodie_commit_time) FROM default.github_events`.
+     * **Execution Logic:** Connects to the Presto coordinator over PyHive DB-API (`port 8080`) and determines the newest batch commit timestamp using `SELECT max(_hoodie_commit_time) FROM hudi.default.github_events`.
      * **Validation Assertions:** Evaluates 5 SQL validation rules strictly scoped to that latest commit instant:
        * *Batch Volume Check:* Validates that `count(*)` in the batch is greater than 0.
        * *Primary Key Completeness:* Confirms zero records contain `id IS NULL OR trim(id) = ''`.
@@ -217,7 +202,7 @@ This guide provides a comprehensive technical breakdown of every repository file
   | `fs.s3a.endpoint` | `{{S3_ENDPOINT}}` | Interpolated at startup to point S3A filesystem operations to MinIO (`http://minio:9000`). |
   | `fs.s3a.path.style.access` | `{{S3_PATH_STYLE_ACCESS}}` | Set to `true` to enforce path-style bucket addressing (`endpoint/bucket/`) required by MinIO. |
   | `fs.s3a.connection.ssl.enabled` | `{{S3_SSL_ENABLED}}` | Set to `false` for internal plain HTTP communication. |
-  | `fs.s3a.aws.credentials.provider` | `EnvironmentVariableCredentialsProvider` | Automatically resolves AWS keys from container environment variables. |
+  | `fs.s3a.aws.credentials.provider` | `com.amazonaws.auth.EnvironmentVariableCredentialsProvider` | Automatically resolves AWS keys from container environment variables. |
 * **Runtime Initialization:** On boot, the container entrypoint substitutes placeholder tokens (`{{...}}`) with active `.env` values, saves the file to `/opt/hive/conf/hive-site.xml`, and creates a symlink to `/opt/hadoop/etc/hadoop/core-site.xml` so Hadoop's internal S3A client shares the identical endpoint settings. It then executes an idempotent schema check (`schematool -dbType mysql -info || schematool -dbType mysql -initSchema`) to initialize the 74 Metastore tables on fresh volumes.
 
 #### `metastore/lib/mysql-connector-j-8.0.33.jar`
@@ -271,13 +256,13 @@ This guide provides a comprehensive technical breakdown of every repository file
 * **Key Configuration Parameters:**
   | Property | Configured Value | Technical Rationale |
   | :--- | :--- | :--- |
-  | `spark.serializer` | `KryoSerializer` | High-efficiency binary serialization required by Hudi's index lookups and payload merging. |
+  | `spark.serializer` | `org.apache.spark.serializer.KryoSerializer` | High-efficiency binary serialization required by Hudi's index lookups and payload merging. |
   | `spark.sql.catalogImplementation` | `hive` | Connects Spark SQL directly to the Hive Metastore catalog. |
   | `spark.sql.hive.convertMetastoreParquet` | `false` | Disables Spark's default Parquet reader, forcing Spark to use Hudi's native input format so that commit timeline metadata and tombstone deletes are respected. |
   | `spark.hadoop.hive.metastore.uris` | `thrift://hive-metastore:9083` | Network location of the Hive Metastore Thrift listener. |
-  | `spark.hadoop.fs.s3a.impl` | `S3AFileSystem` | Binds Hadoop's S3A filesystem client for MinIO object access. |
-  | `spark.hadoop.fs.s3a.aws.credentials.provider` | `EnvironmentVariableCredentialsProvider` | Automatically extracts AWS credentials from container environment variables. |
-  | `spark.jars.packages` | `hudi-spark3.5-bundle_2.12:0.15.0, hadoop-aws:3.3.4` | Pre-packages Hudi lakehouse and AWS S3 connectors on session start. |
+  | `spark.hadoop.fs.s3a.impl` | `org.apache.hadoop.fs.s3a.S3AFileSystem` | Binds Hadoop's S3A filesystem client for MinIO object access. |
+  | `spark.hadoop.fs.s3a.aws.credentials.provider` | `com.amazonaws.auth.EnvironmentVariableCredentialsProvider` | Automatically extracts AWS credentials from container environment variables. |
+  | `spark.jars.packages` | `org.apache.hudi:hudi-spark3.5-bundle_2.12:0.15.0, org.apache.hadoop:hadoop-aws:3.3.4` | Pre-packages Hudi lakehouse and AWS S3 connectors on session start. |
   | `spark.eventLog.enabled` | `true` | Records Spark application metrics to `/tmp/spark-events` for inspection in the Spark History Server. |
 
 #### `spark/github-ingest.properties`
@@ -298,7 +283,7 @@ This guide provides a comprehensive technical breakdown of every repository file
     * `hoodie.cleaner.commits.retained=5`: Retains the latest 5 commits in the timeline, supporting historical time-travel queries while automatically purging older file versions.
     * `hoodie.clustering.inline=true` & `hoodie.clustering.inline.max.commits=4`: Runs inline clustering every 4 commits, combining small Parquet files into optimal 120 MB columnar chunks without needing external compaction daemons.
   * **Schema Provider:**
-    * `hoodie.streamer.schemaprovider.class=FilebasedSchemaProvider`: Instructs `HoodieStreamer` to load the Avro contract from `/opt/spark/conf/github-schema.avsc`.
+    * `hoodie.streamer.schemaprovider.class=org.apache.hudi.utilities.schema.FilebasedSchemaProvider`: Instructs `HoodieStreamer` to load the Avro contract from `/opt/spark/conf/github-schema.avsc`.
 
 #### `spark/github-schema.avsc`
 * **Core Role:** The formal Apache Avro schema contract governing record ingestion into the lakehouse table.
@@ -313,59 +298,6 @@ This guide provides a comprehensive technical breakdown of every repository file
   1. **ACID Upsert (In-Place Mutation):** Selects an existing record from the table, modifies its `created_at` timestamp to the current instant, and writes an update batch using `operation='upsert'`. Proves that Hudi mutates existing Parquet files without duplicating rows or requiring full-table rewrites.
   2. **GDPR Point Delete ("Right to be Forgotten"):** Selects a specific `actor.login` and writes an `operation='delete'` batch targeting only that user's record keys. Demonstrates targeted compliance erasure on columnar object storage without rewriting unaffected partitions.
   3. **Time Travel & Timeline Inspection:** Queries the Hudi commit timeline (`_hoodie_commit_time`) to inspect historical table states across past commit instants, proving reproducible point-in-time analytical historical querying.
-
----
-
-## Persistent volumes
-
-| Volume | Mounted at | Contents | Effect of `docker compose down -v` |
-| :--- | :--- | :--- | :--- |
-| `minio-data` | `minio:/data` | **All raw files and Hudi tables** | Total data loss |
-| `mysql-data` | `mysql-db:/var/lib/mysql` | Metastore schema, table/partition registry | Table definitions lost; `schematool` recreates the schema on next boot |
-| `airflow-data` | `airflow:/opt/airflow/data` | `airflow.db` — DAG run history, task states, users | Run history lost |
-| `airflow-logs` | `airflow:/opt/airflow/logs` | Per-task log files | Logs lost |
-| `spark-ivy-cache` | `spark-client:/root/.ivy2` | ~149 resolved Hudi/Hadoop JARs | Next ingestion re-downloads dependencies |
-| `superset-data` | `superset:/app/superset_home` | Superset metadata DB, saved charts | Dashboards lost |
-
-Note that `airflow-data` is mounted at `/opt/airflow/data`, a **subdirectory**, and the database URL
-points at `/opt/airflow/data/airflow.db`. Mounting a volume at `/opt/airflow` itself would shadow
-both the `dags/` bind mount and Airflow's own installation.
-
----
-
-## Environment variables
-
-Copy `.env.example` to `.env`. All 11 keys have working defaults for local MinIO.
-
-| Variable | Default | Consumed by |
-| :--- | :--- | :--- |
-| `AWS_ACCESS_KEY_ID` | `minioadmin` | MinIO root user; boto3, S3A, and Presto S3 credentials |
-| `AWS_SECRET_ACCESS_KEY` | `minioadmin` | As above |
-| `AWS_REGION` | `us-east-1` | boto3 only (Airflow). MinIO ignores it. |
-| `S3_ENDPOINT` | `http://minio:9000` | Airflow, Spark, Presto, Hive |
-| `S3_BUCKET_NAME` | `github-raw-data` | `minio-init`, Airflow, Spark, the demo script |
-| `S3_PATH_STYLE_ACCESS` | `true` | Spark, Presto, Hive — **must** be `true` for MinIO |
-| `S3_SSL_ENABLED` | `false` | Spark, Presto, Hive — `false` for plain-HTTP MinIO |
-| `MYSQL_ROOT_PASSWORD` | `rootpassword` | MySQL container |
-| `MYSQL_PASSWORD` | `hivepassword` | MySQL container; injected into Hive via `HADOOP_OPTS` |
-| `SUPERSET_SECRET_KEY` | *(long default)* | Superset session signing |
-| `SLACK_WEBHOOK_URL` | *(placeholder)* | Airflow failure alerts — leave unset to disable |
-
-### Switching to Backblaze B2 or AWS S3
-
-No code changes are needed; the S3 layer is fully `.env`-driven:
-
-```bash
-AWS_ACCESS_KEY_ID=<your key>
-AWS_SECRET_ACCESS_KEY=<your secret>
-AWS_REGION=us-east-005
-S3_ENDPOINT=s3.us-east-005.backblazeb2.com   # no scheme → https is assumed
-S3_BUCKET_NAME=<your bucket>
-S3_PATH_STYLE_ACCESS=false                   # cloud providers use virtual-host addressing
-S3_SSL_ENABLED=true
-```
-
-Then stop the `minio` and `minio-init` services — the bucket must already exist remotely.
 
 ---
 
@@ -409,11 +341,7 @@ docker exec spark-client /opt/spark/bin/spark-sql \
 In the **[MinIO Console](http://localhost:9001)** (`minioadmin` / `minioadmin`), navigate to the `github-raw-data` bucket and delete the `hudi-tables/` prefix. This purges old Parquet files and resets Hudi's commit checkpoint.
 
 #### Step 3: Re-trigger the ingestion DAG
-Trigger the pipeline via the [Airflow UI](http://localhost:8085) or run:
-```bash
-docker exec airflow airflow dags trigger github_events_ingestion
-```
-Spark will ingest the raw staging data under your new schema and register fresh table metadata in the Hive Metastore.
+In the **[Airflow UI](http://localhost:8085)** (`admin` / `admin`), click **▶ Trigger DAG** on `github_events_ingestion` (or run `docker exec airflow airflow dags trigger github_events_ingestion`). Spark will ingest the raw staging data under your new schema and register fresh table metadata in the Hive Metastore.
 
 ---
 
@@ -487,14 +415,15 @@ A complete step-by-step workflow: from triggering ingestion and running interact
 
 Trigger the automated 3-task pipeline (`download → ingest → quality gate`):
 
-```bash
-docker exec airflow airflow dags unpause github_events_ingestion
-docker exec airflow airflow dags trigger github_events_ingestion
-```
+1. Open the **[Airflow Web UI](http://localhost:8085)** in your browser (`admin` / `admin`).
+2. Toggle the `github_events_ingestion` DAG to **Active** (unpause).
+3. Click **▶ Trigger DAG** (under the Actions column) to initiate execution.
 
-* **Web UI:** Monitor execution in real time at [http://localhost:8085](http://localhost:8085) (`admin` / `admin`).
-* **Spark Live Progress:** While Task 2 is running, watch executors and stages at [http://localhost:4040](http://localhost:4040).
-* **Spark History:** Review completed job metrics afterwards at [http://localhost:18080](http://localhost:18080).
+*(CLI alternative: `docker exec airflow airflow dags unpause github_events_ingestion && docker exec airflow airflow dags trigger github_events_ingestion`)*
+
+* **Real-Time Pipeline Progress:** Monitor the Grid and Graph views live at [http://localhost:8085](http://localhost:8085).
+* **Spark Live Progress:** While Task 2 (`trigger_hudi_ingestion`) runs, monitor active tasks, stages, and storage at [http://localhost:4040](http://localhost:4040).
+* **Spark History Server:** Review completed job metrics and execution timelines at [http://localhost:18080](http://localhost:18080).
 
 > **Runtime note:** A full 24-hour batch processes ~1.5 million GitHub events across 16 event-type partitions. Downloading raw archives from GitHub dominates the runtime.
 
@@ -502,11 +431,14 @@ docker exec airflow airflow dags trigger github_events_ingestion
 
 ### 2. Query the lakehouse with Presto
 
-Launch the interactive Presto CLI connected to the Hudi catalog:
+You can run interactive SQL queries against the lakehouse either directly in your browser using **Apache Superset SQL Lab** or via the **Presto CLI** in your terminal:
 
-```bash
-docker exec -it presto-server presto-cli --catalog hudi --schema default
-```
+* **Option A: Apache Superset SQL Lab (Web UI — Recommended):**
+  Open **[http://localhost:8088](http://localhost:8088)** (`admin` / `admin`) → navigate to **SQL Lab** → **SQL Editor** → select Database: `Presto`, Schema: `default`.
+* **Option B: Presto CLI (Terminal):**
+  ```bash
+  docker exec -it presto-server presto-cli --catalog hudi --schema default
+  ```
 
 #### A. Discover tables & partition distribution
 ```sql
@@ -663,10 +595,7 @@ Common issues, root causes, and step-by-step resolutions.
 
 #### Presto error: `Table hudi.default.github_events does not exist`
 * **Cause:** The table has not been created yet because the Airflow pipeline has not run.
-* **Resolution:** Trigger the DAG via the [Airflow UI](http://localhost:8085) (`admin`/`admin`) or run:
-  ```bash
-  docker exec airflow airflow dags trigger github_events_ingestion
-  ```
+* **Resolution:** In the **[Airflow UI](http://localhost:8085)** (`admin` / `admin`), unpause `github_events_ingestion` and click **▶ Trigger DAG** (or run `docker exec airflow airflow dags trigger github_events_ingestion`).
 * **Technical Note:** If the DAG reported success but the table is still missing, inspect the `trigger_hudi_ingestion` task logs for `"Nothing to commit"`. This indicates no raw `.json.gz` files were found in `s3://github-raw-data/github-raw/`.
 
 #### Spark job fails with `OutOfMemoryError: Java heap space`
@@ -675,7 +604,7 @@ Common issues, root causes, and step-by-step resolutions.
   1. **Allocate more RAM (Recommended):** In Docker Desktop → Settings → Resources, allocate at least **16 GB** memory.
   2. **Reduce concurrency:** In `airflow/dags/github_ingestion_dag.py`, change `--master local[4]` to `--master local[2]` to cut concurrent partition inflation in half.
   3. **Lower batch limit:** In `airflow/dags/github_ingestion_dag.py`, reduce `--source-limit` to `268435456` (256 MB).
-* **Technical Note:** GitHub Archive `.json.gz` files are non-splittable, so each file becomes one Spark partition. Local mode runs all tasks in a single driver JVM. You can inspect actual executor memory usage at `http://localhost:18080` → application → **Environment**.
+* **Technical Note:** GitHub Archive `.json.gz` files are non-splittable, so each file becomes one Spark partition. Local mode runs all tasks in a single driver JVM. You can inspect configured driver memory settings and environment properties at `http://localhost:18080` → application → **Environment**.
 
 #### Airflow web UI lost previous DAG run history
 * **Cause:** Running `docker compose down -v` deletes Docker storage volumes, including `airflow-data` where SQLite stores run history.

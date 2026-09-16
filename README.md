@@ -841,8 +841,6 @@ The engineering rationale, trade-offs, and production context behind key archite
 
 Common issues, root causes, and step-by-step resolutions.
 
----
-
 ### 1. Containers & Startup
 
 #### `minio-init` container status is `Exited (0)`
@@ -858,7 +856,6 @@ Common issues, root causes, and step-by-step resolutions.
   ```
 * **Technical Note:** The container entrypoint executes `schematool -dbType mysql -info || schematool -dbType mysql -initSchema`. If MySQL was interrupted during first initialization, triggering `schematool` manually restores the 74 metadata tables.
 
----
 
 ### 2. Ingestion & Pipeline Issues
 
@@ -882,7 +879,6 @@ Common issues, root causes, and step-by-step resolutions.
 * **Cause:** Running `docker compose down -v` deletes Docker storage volumes, including `airflow-data` where SQLite stores run history.
 * **Resolution:** To stop containers without losing run history or ingested tables, run `docker compose down` (without the `-v` flag).
 
----
 
 ### 3. Querying & Storage
 
@@ -907,8 +903,6 @@ Common issues, root causes, and step-by-step resolutions.
   docker compose restart presto-server presto-worker-1 presto-worker-2
   ```
 * **Technical Note:** Presto's entrypoint dynamically copies read-only mounted files to `/tmp/etc` and appends `hive.s3.*` credentials from environment variables before launching.
-
----
 
 ### 4. Platform Resets
 

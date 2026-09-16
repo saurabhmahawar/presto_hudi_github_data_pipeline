@@ -11,21 +11,6 @@ SQL-based data-quality gate.
   <img src="images/lakehouse_architecture.png" alt="Lakehouse Architecture Diagram" width="100%" />
 </p>
 
-### Scope and honest limitations
-
-This is a **learning and demonstration platform**, not a production deployment. Specifically:
-
-- Airflow runs the `SequentialExecutor` against a **SQLite** database — one task at a time, no parallelism.
-- Spark runs in **local mode** (`--master local[4]`) inside a single container. There is no Spark cluster,
-  and therefore no executors — only a driver JVM.
-- Every credential defaults to a well-known value (`admin`/`admin`, `minioadmin`/`minioadmin`).
-- There is no authentication, TLS, or authorisation on any endpoint.
-- Ingestion is **batch only**. There is no streaming or CDC path.
-- The Avro schema is **contract-driven** — see
-  [Schema management & evolution](#schema-management--evolution) for details on schema handling.
-
-Everything else below is verified against the running stack.
-
 ---
 
 ## Table of contents

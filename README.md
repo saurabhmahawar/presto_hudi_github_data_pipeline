@@ -84,10 +84,10 @@ presto-hudi-cos/
 │
 ├── images/
 │   ├── lakehouse_architecture.png        # Architecture diagram used above
-│   ├── superset_dashboard_overview.png   # Full-page Superset analytics dashboard snapshot (placeholder)
-│   ├── superset_activity_trends.png      # Temporal volume, event distribution, and activity heatmap (placeholder)
-│   ├── superset_community_insights.png   # Human vs bot breakdown, top developers, and organizations (placeholder)
-│   └── superset_engineering_health.png   # PR merge rates, issue resolution, and repository velocity (placeholder)
+│   ├── superset_dashboard_overview.png   # Complete 15-chart analytics dashboard full-view snapshot
+│   ├── superset_dashboard_part1.png      # Tier 1: Activity heatmap, hourly volume, and top contributors
+│   ├── superset_dashboard_part2.png      # Tier 2: Community ecosystem, live event feed, and PR velocity
+│   └── superset_dashboard_part3.png      # Tier 3: Issue resolution, human vs bot telemetry, and AI agents
 │
 ├── airflow/
 │   └── dags/
@@ -528,14 +528,10 @@ Rather than relying on static extracts or batch data copies, Superset queries Hu
 
 ### Executive Dashboard: `GitHub Archive Analytics (Last 24 Hours)`
 
-<!-- ================================================================= -->
-<!-- PLACEHOLDER: Full Dashboard Overview Screenshot                  -->
-<!-- Replace 'images/superset_dashboard_overview.png' with your image  -->
-<!-- ================================================================= -->
 <p align="center">
   <img src="images/superset_dashboard_overview.png" alt="GitHub Archive Analytics Dashboard Overview" width="100%" />
 </p>
-<p align="center"><em>Figure 2: Executive overview of the 15-chart GitHub Archive Analytics dashboard in Apache Superset.</em></p>
+<p align="center"><em>Figure 2: Complete executive overview of the 15-chart GitHub Archive Analytics dashboard in Apache Superset.</em></p>
 
 * **Target URL:** [http://localhost:8088/superset/dashboard/1/](http://localhost:8088/superset/dashboard/1/)
 * **Default Credentials:** `admin` / `admin`
@@ -549,14 +545,10 @@ The dashboard is structured into three specialized analytical tiers:
 
 Monitors event firehose throughput, global developer time-zone work cycles, and event type distributions across 16 GitHub action streams.
 
-<!-- ================================================================= -->
-<!-- PLACEHOLDER: Activity Trends & Heatmap Screenshot                -->
-<!-- Replace 'images/superset_activity_trends.png' with your image     -->
-<!-- ================================================================= -->
 <p align="center">
-  <img src="images/superset_activity_trends.png" alt="Activity Trends, Heatmap, and Hourly Volume" width="100%" />
+  <img src="images/superset_dashboard_part1.png" alt="Activity Trends, Heatmap, and Top Contributors" width="100%" />
 </p>
-<p align="center"><em>Figure 3: Temporal event distributions, hourly cadence curves, and weekly activity heatmaps.</em></p>
+<p align="center"><em>Figure 3: Macro activity metrics, temporal heatmaps, volume over time, and top contributors.</em></p>
 
 * **Total Events (KPI Scorecard with Trendline):** Displays the total dataset scale (**1.78M events**) with an hourly sparkline trend showing diurnal activity progression across the 24-hour window.
 * **Activity Heatmap (Day × Hour of Week):** A two-dimensional density matrix plotting hours `0` through `23` (UTC) against day names (`Wednesday`, `Thursday`), identifying prime engineering surges between 13:00 and 17:00 UTC.
@@ -569,14 +561,10 @@ Monitors event firehose throughput, global developer time-zone work cycles, and 
 
 Separates true human community contributions from modern automated CI/CD bots, dependency updaters, and agent activity.
 
-<!-- ================================================================= -->
-<!-- PLACEHOLDER: Developer Ecosystem & Bot Telemetry Screenshot      -->
-<!-- Replace 'images/superset_community_insights.png' with your image  -->
-<!-- ================================================================= -->
 <p align="center">
-  <img src="images/superset_community_insights.png" alt="Developer Ecosystem, Human vs Bot Distribution, and Top Engineers" width="100%" />
+  <img src="images/superset_dashboard_part2.png" alt="Community Ecosystem, Event Feed, and PR Lifecycle" width="100%" />
 </p>
-<p align="center"><em>Figure 4: Developer segmentation comparing human engineers vs. automated agents, top contributors, and organizations.</em></p>
+<p align="center"><em>Figure 4: Organization activity, live event audits, trending repositories, and PR merge efficiency.</em></p>
 
 * **Developer Ecosystem (Humans vs AI & Automation Bots):** Quantifies open-source automation penetration. Demonstrates that **~19.6% (348.5k)** of all GitHub events are driven by bots, while **~80.4% (1.43M)** represent human developer activity.
 * **Top Human Developers by Event Count:** A sanitized leaderboard strictly filtering out bot accounts (`actor_type == 'Human Developers'`), accurately recognizing the most active open-source engineers and maintainers.
@@ -589,14 +577,10 @@ Separates true human community contributions from modern automated CI/CD bots, d
 
 Provides actionable signals on repository popularity, downstream adoption, pull request acceptance efficiency, and community issue triage velocity.
 
-<!-- ================================================================= -->
-<!-- PLACEHOLDER: Engineering Health & Velocity Screenshot            -->
-<!-- Replace 'images/superset_engineering_health.png' with your image  -->
-<!-- ================================================================= -->
 <p align="center">
-  <img src="images/superset_engineering_health.png" alt="PR Merge Rates, Issue Resolution, and Trending Repositories" width="100%" />
+  <img src="images/superset_dashboard_part3.png" alt="Issue Resolution, Humans vs Bots, and AI Automation" width="100%" />
 </p>
-<p align="center"><em>Figure 5: Engineering velocity showing PR merge efficiency, issue resolution balance, and star momentum.</em></p>
+<p align="center"><em>Figure 5: Issue resolution efficiency, human vs. bot developer segmentation, and AI automation telemetry.</em></p>
 
 * **Pull Request Lifecycle & Merge Success Rate:** Analyzes PR completion efficiency. Measures opened vs. merged vs. closed without merge, demonstrating a **92.4% merge efficiency** (~59k merged vs ~4.8k closed unmerged out of ~72k opened).
 * **Issue Resolution Efficiency (Opened vs. Closed):** Balances incoming community tickets against resolved bugs and feature requests (~21k opened vs ~14k closed), tracking project backlog health.

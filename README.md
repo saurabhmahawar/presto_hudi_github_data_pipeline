@@ -634,29 +634,34 @@ To provide instant query performance and eliminate runtime string manipulation i
 
 ```sql
 SELECT
-    id,
-    type,
-    public,
-    CAST(from_iso8601_timestamp(created_at) AS TIMESTAMP) AS event_time,
-    CAST(from_iso8601_timestamp(created_at) AS DATE)      AS event_date,
-    date_format(from_iso8601_timestamp(created_at), '%W') AS day_name,
-    hour(from_iso8601_timestamp(created_at))             AS event_hour,
-    actor.login                                          AS actor_login,
-    repo.name                                            AS repo_name,
-    COALESCE(org.login, '')                              AS org_login,
-    json_extract_scalar(payload, '$.action')             AS action,
-    json_extract_scalar(payload, '$.issue.title')        AS issue_title,
-    json_extract_scalar(payload, '$.release.tag_name')   AS release_tag,
-    CASE 
-        WHEN actor.login LIKE '%[bot]' 
-          OR actor.login LIKE '%-bot' 
-          OR actor.login LIKE '%bot-%'
-          OR actor.login IN ('dependabot', 'github-actions', 'renovate', 'codecov')
-        THEN 'Automation & Bots'
-        ELSE 'Human Developers'
-    END                                                  AS actor_type
+  id,
+  type,
+  public,
+  from_iso8601_timestamp(created_at) AS event_time,
+  date(from_iso8601_timestamp(created_at)) AS event_date,
+  hour(from_iso8601_timestamp(created_at)) AS event_hour,
+  CASE day_of_week(from_iso8601_timestamp(created_at))
+    WHEN 1 THEN '1. Mon'
+    WHEN 2 THEN '2. Tue'
+    WHEN 3 THEN '3. Wed'
+    WHEN 4 THEN '4. Thu'
+    WHEN 5 THEN '5. Fri'
+    WHEN 6 THEN '6. Sat'
+    WHEN 7 THEN '7. Sun'
+  END AS day_name,
+  actor.login AS actor_login,
+  CASE
+    WHEN actor.login LIKE '%[bot]%' OR actor.login IN ('Copilot', 'web-flow', 'github-actions')
+    THEN 'Automation & Bots'
+    ELSE 'Human Developers'
+  END AS actor_type,
+  repo.name AS repo_name,
+  org.login AS org_login,
+  COALESCE(payload.action, 'action') AS action,
+  payload.release.tag_name AS release_tag,
+  payload.issue.title AS issue_title
 FROM hudi.default.github_events
-WHERE id != '15182084537';
+WHERE id != '15182084537'
 ```
 
 ---

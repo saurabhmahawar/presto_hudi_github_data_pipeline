@@ -85,9 +85,9 @@ presto-hudi-cos/
 ├── images/
 │   ├── lakehouse_architecture.png        # Architecture diagram used above
 │   ├── superset_dashboard_overview.png   # Complete 15-chart analytics dashboard full-view snapshot
-│   ├── superset_dashboard_part1.png      # Tier 1: Activity heatmap, hourly volume, and top contributors
-│   ├── superset_dashboard_part2.png      # Tier 2: Community ecosystem, live event feed, and PR velocity
-│   └── superset_dashboard_part3.png      # Tier 3: Issue resolution, human vs bot telemetry, and AI agents
+│   ├── superset_dashboard_part1.png      # View 1: Event activity, temporal trends, and top contributors
+│   ├── superset_dashboard_part2.png      # View 2: Organizations, live event feed, and repository momentum
+│   └── superset_dashboard_part3.png      # View 3: Issue resolution, human vs bot telemetry, and AI agents
 │
 ├── airflow/
 │   └── dags/
@@ -537,56 +537,58 @@ Rather than relying on static extracts or batch data copies, Superset queries Hu
 * **Default Credentials:** `admin` / `admin`
 * **Underlying Semantic Layer:** Virtual Dataset `github_events_flat` over `hudi.default.github_events` (1,778,532 audited records)
 
-The dashboard is structured into three specialized analytical tiers:
+The dashboard is organized into three sequential analytical views matching the visual layout of the board:
 
 ---
 
-### Tier 1: Macro Activity & Temporal Velocity
+### 1. Global Activity, Event Velocity & Top Contributors
 
-Monitors event firehose throughput, global developer time-zone work cycles, and event type distributions across 16 GitHub action streams.
+Covers global event firehose throughput, diurnal work patterns, event type compositions, and leading project/developer activity.
 
 <p align="center">
-  <img src="images/superset_dashboard_part1.png" alt="Activity Trends, Heatmap, and Top Contributors" width="100%" />
+  <img src="images/superset_dashboard_part1.png" alt="Global Activity, Heatmap, and Top Contributors" width="100%" />
 </p>
-<p align="center"><em>Figure 3: Macro activity metrics, temporal heatmaps, volume over time, and top contributors.</em></p>
+<p align="center"><em>Figure 3: High-level throughput metrics, weekly heatmaps, hourly volume trends, and top contributors.</em></p>
 
-* **Total Events (KPI Scorecard with Trendline):** Displays the total dataset scale (**1.78M events**) with an hourly sparkline trend showing diurnal activity progression across the 24-hour window.
-* **Activity Heatmap (Day × Hour of Week):** A two-dimensional density matrix plotting hours `0` through `23` (UTC) against day names (`Wednesday`, `Thursday`), identifying prime engineering surges between 13:00 and 17:00 UTC.
-* **Events by Type (Macro Distribution):** High-level breakdown across all 16 GitHub event types, showcasing `PushEvent` as the dominant driver (~65%), followed by `CreateEvent` and `PullRequestEvent`.
-* **Event Volume Over Time (Hourly Velocity):** Smooth timeseries tracking the top 5 event types hour-by-hour to pinpoint traffic bursts and pipeline ingestion consistency.
+* **Total Events (KPI Scorecard with Trendline):** Displays the aggregate lakehouse ingestion volume (**1.78M events**) with a 24-hour sparkline tracking diurnal traffic flow.
+* **Activity Heatmap (Day × Hour of Week):** Two-dimensional density matrix plotting hours `0`–`23` across days (`3. Wed`, `4. Thu`), highlighting peak global developer activity windows (51.1k to 97.2k events/hr).
+* **Events by Type (Donut Distribution):** Macro breakdown across all 16 GitHub event streams, with `PushEvent` representing the majority (~65%), followed by `CreateEvent`, `PullRequestEvent`, and `IssueCommentEvent`.
+* **Event Volume Over Time (Hourly Velocity):** Smooth timeseries tracking hourly volume for the top event types to monitor pipeline stability and identify traffic surges.
+* **Top Repositories by Event Count:** Highlights the most active open-source repositories by aggregate event count (led by high-frequency repos exceeding 2.5k events).
+* **Top Developers by Event Count:** A sanitized community leaderboard strictly filtered to human engineers (`actor_type == 'Human Developers'`), spotlighting authentic contributors without automated CI/CD noise.
 
 ---
 
-### Tier 2: Developer Ecosystem & Human vs. AI Automation
+### 2. Organizations, Live Event Feed & Repository Momentum
 
-Separates true human community contributions from modern automated CI/CD bots, dependency updaters, and agent activity.
+Tracks enterprise engagement, real-time event audits, community star velocity, project branching, and pull request acceptance rates.
 
 <p align="center">
-  <img src="images/superset_dashboard_part2.png" alt="Community Ecosystem, Event Feed, and PR Lifecycle" width="100%" />
+  <img src="images/superset_dashboard_part2.png" alt="Organizations, Live Event Feed, and Repository Momentum" width="100%" />
 </p>
-<p align="center"><em>Figure 4: Organization activity, live event audits, trending repositories, and PR merge efficiency.</em></p>
+<p align="center"><em>Figure 4: Organization activity, live audit table, trending repositories, and PR merge efficiency.</em></p>
 
-* **Developer Ecosystem (Humans vs AI & Automation Bots):** Quantifies open-source automation penetration. Demonstrates that **~19.6% (348.5k)** of all GitHub events are driven by bots, while **~80.4% (1.43M)** represent human developer activity.
-* **Top Human Developers by Event Count:** A sanitized leaderboard strictly filtering out bot accounts (`actor_type == 'Human Developers'`), accurately recognizing the most active open-source engineers and maintainers.
-* **Top AI Agents & Automation Bots:** Dedicated telemetry tracking automated actors, highlighting high-frequency automation such as `dependabot[bot]`, `github-actions[bot]`, and auto-formatting bots.
-* **Top Organizations by Activity:** Identifies the enterprise and open-source foundations driving the most ecosystem changes (e.g., Google, Microsoft, Apache Software Foundation, Cloudflare).
+* **Top Organizations by Event Count:** Identifies high-volume enterprise and open-source organizations driving ecosystem changes (e.g., Microsoft, Apache, PostHog, NVIDIA, Uniswap).
+* **Event Types (All — Ranked Audit Table):** Comprehensive inventory of all 16 event classes with exact record counts and proportional share.
+* **Recent Events (Live Feed Table):** Real-time chronological event stream (`event_time`, `type`, `actor_login`) enabling instant end-to-end verification of lakehouse ingestion.
+* **Trending Repositories (Star Velocity):** Ranks projects by `WatchEvent` frequency to pinpoint open-source repositories experiencing breakout viral interest.
+* **Most Forked Projects (Ecosystem Growth):** Tracks `ForkEvent` activity to evaluate downstream codebase adoption, experimentation, and ecosystem branching.
+* **PR Lifecycle & Merge Success Rate:** Analyzes pull request throughput across 136k PR events (**53.00%** opened, **43.43%** merged, ~3.57% closed unmerged), demonstrating a **92.4% merge efficiency** among completed pull requests.
 
 ---
 
-### Tier 3: Engineering Health, PR Velocity & Repository Trends
+### 3. Issue Resolution & AI Agent Automation
 
-Provides actionable signals on repository popularity, downstream adoption, pull request acceptance efficiency, and community issue triage velocity.
+Provides visibility into community issue maintenance responsiveness, human vs. bot labor ratios, and automated AI agent footprint.
 
 <p align="center">
   <img src="images/superset_dashboard_part3.png" alt="Issue Resolution, Humans vs Bots, and AI Automation" width="100%" />
 </p>
-<p align="center"><em>Figure 5: Issue resolution efficiency, human vs. bot developer segmentation, and AI automation telemetry.</em></p>
+<p align="center"><em>Figure 5: Issue resolution efficiency, human vs. bot developer segmentation, and top automated AI agents.</em></p>
 
-* **Pull Request Lifecycle & Merge Success Rate:** Analyzes PR completion efficiency. Measures opened vs. merged vs. closed without merge, demonstrating a **92.4% merge efficiency** (~59k merged vs ~4.8k closed unmerged out of ~72k opened).
-* **Issue Resolution Efficiency (Opened vs. Closed):** Balances incoming community tickets against resolved bugs and feature requests (~21k opened vs ~14k closed), tracking project backlog health.
-* **Trending Repositories (Star Velocity):** Real-time gauge of open-source momentum, ranking repositories by `WatchEvent` velocity to spot breakout projects.
-* **Most Forked Projects (Ecosystem Growth):** Tracks `ForkEvent` actions to quantify codebase reuse, downstream experimentation, and ecosystem branching.
-* **Top Repositories by Event Count:** Highlights repositories with the highest aggregate interaction volume across all event types.
+* **Issue Resolution Efficiency (Opened vs. Closed):** Compares incoming community issues against closed issues (~21k opened vs ~14k closed), measuring maintainer triage responsiveness and backlog health.
+* **Developer Ecosystem (Humans vs. AI & Automation Bots):** Donut chart measuring automation penetration across the open-source landscape — **80.40% (1.43M)** human developer events versus **19.60% (348.5k)** automated bot events.
+* **Top AI Agents & Automation Bots:** Telemetry dedicated to automated actors, tracking high-frequency tooling such as `github-actions[bot]`, `dependabot[bot]`, `pull[bot]`, `coderabbitai[bot]`, and `Copilot`.
 
 ---
 

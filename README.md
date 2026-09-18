@@ -22,6 +22,7 @@ SQL-based data-quality gate.
 - [Schema management & evolution](#schema-management--evolution)
 - [Quickstart](#quickstart)
 - [Operating the platform](#operating-the-platform)
+- [Analytics & BI Dashboards (Apache Superset)](#analytics--bi-dashboards-apache-superset)
 - [Design decisions explained](#design-decisions-explained)
 - [Troubleshooting](#troubleshooting)
 
@@ -82,7 +83,11 @@ presto-hudi-cos/
 ├── docker-compose.yml                    # Defines all 10 services, 6 volumes, and 1 network
 │
 ├── images/
-│   └── lakehouse_architecture.png        # Architecture diagram used above
+│   ├── lakehouse_architecture.png        # Architecture diagram used above
+│   ├── superset_dashboard_overview.png   # Full-page Superset analytics dashboard snapshot (placeholder)
+│   ├── superset_activity_trends.png      # Temporal volume, event distribution, and activity heatmap (placeholder)
+│   ├── superset_community_insights.png   # Human vs bot breakdown, top developers, and organizations (placeholder)
+│   └── superset_engineering_health.png   # PR merge rates, issue resolution, and repository velocity (placeholder)
 │
 ├── airflow/
 │   └── dags/
@@ -416,14 +421,28 @@ Trigger the automated 3-task pipeline (`download → ingest → quality gate`):
 
 ### 2. Query the lakehouse with Presto
 
-You can run interactive SQL queries against the lakehouse either directly in your browser using **Apache Superset SQL Lab** or via the **Presto CLI** in your terminal:
+You can run interactive SQL queries against the lakehouse either directly in your browser using **Apache Superset SQL Lab** or via the **Presto CLI** in your terminal.
 
-* **Option A: Apache Superset SQL Lab (Web UI — Recommended):**
-  Open **[http://localhost:8088](http://localhost:8088)** (`admin` / `admin`) → navigate to **SQL Lab** → **SQL Editor** → select Database: `Presto`, Schema: `default`.
-* **Option B: Presto CLI (Terminal):**
-  ```bash
-  docker exec -it presto-server presto-cli --catalog hudi --schema default
-  ```
+#### Option A: Apache Superset SQL Lab (Web UI — Recommended)
+
+1. Open **[http://localhost:8088](http://localhost:8088)** in your browser (`admin` / `admin`).
+2. **Connect to Presto (First-time setup):**
+   * Navigate to **Settings** (top right) → **Database Connections** → **+ Database**.
+   * Select **Presto** from the database dropdown.
+   * Enter the internal Docker SQLAlchemy URI:
+     ```text
+     presto://superset@presto-server:8080/hudi/default
+     ```
+   * Click **Test connection** (expect a green success message), then click **Connect**.
+3. **Open SQL Lab:**
+   * Navigate to **SQL Lab** → **SQL Editor**.
+   * Select **Database:** `Presto` (or `hudi`), **Schema:** `default`.
+   * Start executing queries against `github_events`.
+
+#### Option B: Presto CLI (Terminal)
+```bash
+docker exec -it presto-server presto-cli --catalog hudi --schema default
+```
 
 #### A. Discover tables & partition distribution
 ```sql
@@ -490,17 +509,155 @@ This interactive script executes three live demonstrations:
 
 ### 4. Visualize data in Apache Superset
 
-Connect Superset to Presto to create charts and dashboards:
+With the Presto database connection configured in Step 2, explore the pre-built production dashboards (persisted across container lifecycles in the `superset-data` volume):
 
 1. Open **[http://localhost:8088](http://localhost:8088)** in your browser (`admin` / `admin`).
-2. Navigate to **Settings** (top right) → **Database Connections** → **+ Database**.
-3. Select **Presto** from the database dropdown.
-4. Enter the internal Docker SQLAlchemy URI:
-   ```text
-   presto://superset@presto-server:8080/hudi/default
-   ```
-5. Click **Test connection** (expect a green success message), then click **Connect**.
-6. Open **SQL Lab → SQL Editor**, select the `hudi` catalog and `default` schema, and start querying.
+2. Navigate directly to the production analytics dashboard:
+   * **[GitHub Archive Analytics (Last 24 Hours)](http://localhost:8088/superset/dashboard/1/)** — 15 interactive charts spanning activity heatmaps, developer community metrics, AI bot automation, and PR/issue engineering velocity.
+3. Use the dashboard controls to filter by date or event type, or create new custom visualizations directly from the `github_events_flat` virtual dataset.
+
+> 📊 **Full Dashboard Showcase:** See the dedicated [Analytics & BI Dashboards](#analytics--bi-dashboards-apache-superset) section below for chart breakdowns, metric matrices, and screenshot placeholders.
+
+---
+
+## Analytics & BI Dashboards (Apache Superset)
+
+The analytical presentation layer is powered by **[Apache Superset](https://superset.apache.org/)**, delivering real-time interactive business intelligence directly on top of the Apache Hudi lakehouse via distributed **PrestoDB** queries.
+
+Rather than relying on static extracts or batch data copies, Superset queries Hudi's Copy-on-Write Parquet files on MinIO directly with zero ETL replication. Dashboards and chart configurations are fully persisted inside the `superset-data` named Docker volume.
+
+### Executive Dashboard: `GitHub Archive Analytics (Last 24 Hours)`
+
+<!-- ================================================================= -->
+<!-- PLACEHOLDER: Full Dashboard Overview Screenshot                  -->
+<!-- Replace 'images/superset_dashboard_overview.png' with your image  -->
+<!-- ================================================================= -->
+<p align="center">
+  <img src="images/superset_dashboard_overview.png" alt="GitHub Archive Analytics Dashboard Overview" width="100%" />
+</p>
+<p align="center"><em>Figure 2: Executive overview of the 15-chart GitHub Archive Analytics dashboard in Apache Superset.</em></p>
+
+* **Target URL:** [http://localhost:8088/superset/dashboard/1/](http://localhost:8088/superset/dashboard/1/)
+* **Default Credentials:** `admin` / `admin`
+* **Underlying Semantic Layer:** Virtual Dataset `github_events_flat` over `hudi.default.github_events` (1,778,532 audited records)
+
+The dashboard is structured into three specialized analytical tiers:
+
+---
+
+### Tier 1: Macro Activity & Temporal Velocity
+
+Monitors event firehose throughput, global developer time-zone work cycles, and event type distributions across 16 GitHub action streams.
+
+<!-- ================================================================= -->
+<!-- PLACEHOLDER: Activity Trends & Heatmap Screenshot                -->
+<!-- Replace 'images/superset_activity_trends.png' with your image     -->
+<!-- ================================================================= -->
+<p align="center">
+  <img src="images/superset_activity_trends.png" alt="Activity Trends, Heatmap, and Hourly Volume" width="100%" />
+</p>
+<p align="center"><em>Figure 3: Temporal event distributions, hourly cadence curves, and weekly activity heatmaps.</em></p>
+
+* **Total Events (KPI Scorecard with Trendline):** Displays the total dataset scale (**1.78M events**) with an hourly sparkline trend showing diurnal activity progression across the 24-hour window.
+* **Activity Heatmap (Day × Hour of Week):** A two-dimensional density matrix plotting hours `0` through `23` (UTC) against day names (`Wednesday`, `Thursday`), identifying prime engineering surges between 13:00 and 17:00 UTC.
+* **Events by Type (Macro Distribution):** High-level breakdown across all 16 GitHub event types, showcasing `PushEvent` as the dominant driver (~65%), followed by `CreateEvent` and `PullRequestEvent`.
+* **Event Volume Over Time (Hourly Velocity):** Smooth timeseries tracking the top 5 event types hour-by-hour to pinpoint traffic bursts and pipeline ingestion consistency.
+
+---
+
+### Tier 2: Developer Ecosystem & Human vs. AI Automation
+
+Separates true human community contributions from modern automated CI/CD bots, dependency updaters, and agent activity.
+
+<!-- ================================================================= -->
+<!-- PLACEHOLDER: Developer Ecosystem & Bot Telemetry Screenshot      -->
+<!-- Replace 'images/superset_community_insights.png' with your image  -->
+<!-- ================================================================= -->
+<p align="center">
+  <img src="images/superset_community_insights.png" alt="Developer Ecosystem, Human vs Bot Distribution, and Top Engineers" width="100%" />
+</p>
+<p align="center"><em>Figure 4: Developer segmentation comparing human engineers vs. automated agents, top contributors, and organizations.</em></p>
+
+* **Developer Ecosystem (Humans vs AI & Automation Bots):** Quantifies open-source automation penetration. Demonstrates that **~19.6% (348.5k)** of all GitHub events are driven by bots, while **~80.4% (1.43M)** represent human developer activity.
+* **Top Human Developers by Event Count:** A sanitized leaderboard strictly filtering out bot accounts (`actor_type == 'Human Developers'`), accurately recognizing the most active open-source engineers and maintainers.
+* **Top AI Agents & Automation Bots:** Dedicated telemetry tracking automated actors, highlighting high-frequency automation such as `dependabot[bot]`, `github-actions[bot]`, and auto-formatting bots.
+* **Top Organizations by Activity:** Identifies the enterprise and open-source foundations driving the most ecosystem changes (e.g., Google, Microsoft, Apache Software Foundation, Cloudflare).
+
+---
+
+### Tier 3: Engineering Health, PR Velocity & Repository Trends
+
+Provides actionable signals on repository popularity, downstream adoption, pull request acceptance efficiency, and community issue triage velocity.
+
+<!-- ================================================================= -->
+<!-- PLACEHOLDER: Engineering Health & Velocity Screenshot            -->
+<!-- Replace 'images/superset_engineering_health.png' with your image  -->
+<!-- ================================================================= -->
+<p align="center">
+  <img src="images/superset_engineering_health.png" alt="PR Merge Rates, Issue Resolution, and Trending Repositories" width="100%" />
+</p>
+<p align="center"><em>Figure 5: Engineering velocity showing PR merge efficiency, issue resolution balance, and star momentum.</em></p>
+
+* **Pull Request Lifecycle & Merge Success Rate:** Analyzes PR completion efficiency. Measures opened vs. merged vs. closed without merge, demonstrating a **92.4% merge efficiency** (~59k merged vs ~4.8k closed unmerged out of ~72k opened).
+* **Issue Resolution Efficiency (Opened vs. Closed):** Balances incoming community tickets against resolved bugs and feature requests (~21k opened vs ~14k closed), tracking project backlog health.
+* **Trending Repositories (Star Velocity):** Real-time gauge of open-source momentum, ranking repositories by `WatchEvent` velocity to spot breakout projects.
+* **Most Forked Projects (Ecosystem Growth):** Tracks `ForkEvent` actions to quantify codebase reuse, downstream experimentation, and ecosystem branching.
+* **Top Repositories by Event Count:** Highlights repositories with the highest aggregate interaction volume across all event types.
+
+---
+
+### Complete Chart Catalog & Metric Matrix
+
+| # | Chart Title | Chart Type | Key Metrics & Slices | Applied Filters / Business Value |
+| :-: | :--- | :--- | :--- | :--- |
+| **1** | **Total Events** | Big Number w/ Trendline | `COUNT(*)` = **1,778,532** | 24-hr sparkline tracking global lakehouse ingest throughput. |
+| **2** | **Activity Heatmap (Day × Hour)** | Heatmap (`heatmap_v2`) | `event_hour` (0–23) × `day_name` | Identifies peak global engineering hours in UTC. |
+| **3** | **Events by Type** | Donut Chart (`pie`) | 16 distinct event categories | Macro composition of GitHub activity stream. |
+| **4** | **Event Volume Over Time** | Smooth Timeseries | Hourly `COUNT(*)` by top 5 types | Monitors ingestion stability and traffic spikes. |
+| **5** | **Top Repositories by Event Count** | Horizontal Bar | Top 10 repositories by events | Identifies highest-traffic code repositories. |
+| **6** | **Top Developers by Event Count** | Horizontal Bar | Top 10 human `actor_login` | Filter: `actor_type == 'Human Developers'` (no bot noise). |
+| **7** | **Top Organizations by Event Count** | Horizontal Bar | Top 10 `org_login` | Filter: `org_login != ''` (tracks enterprise OSS presence). |
+| **8** | **Event Types (All)** | Ranked Table | 16 event rows with % share | Complete audited inventory of all event classes. |
+| **9** | **Recent Events (Live Feed)** | Table (Raw Records) | Last 20 raw events (`DESC`) | Real-time event stream verification and auditing. |
+| **10** | **Trending Repositories (Stars)** | Horizontal Bar | Top 10 starred repos | Filter: `type == 'WatchEvent'` (star velocity metric). |
+| **11** | **Most Forked Projects** | Horizontal Bar | Top 10 forked repos | Filter: `type == 'ForkEvent'` (ecosystem adoption metric). |
+| **12** | **PR Lifecycle & Merge Rate** | Donut Chart (`pie`) | `opened`, `merged`, `closed` | 92.4% merge efficiency indicator for engineering health. |
+| **13** | **Issue Resolution Efficiency** | Bar Chart | `opened` (21k) vs `closed` (14k) | Measures maintainer triage responsiveness (66.7% close rate). |
+| **14** | **Developer Ecosystem: Humans vs Bots** | Donut Chart (`pie`) | `Human Developers` vs `Bots` | Quantifies bot footprint (~19.6%) vs human effort (~80.4%). |
+| **15** | **Top AI Agents & Automation Bots** | Horizontal Bar | Top 10 automated actors | Filter: `actor_type == 'Automation & Bots'` (Dependabot, CI). |
+
+---
+
+### Semantic Layer: Presto Virtual Dataset (`github_events_flat`)
+
+To provide instant query performance and eliminate runtime string manipulation in charts, Superset leverages a Presto-backed **Virtual Dataset**. This acts as a logical view directly over Hudi without writing duplicate tables to MinIO:
+
+```sql
+SELECT
+    id,
+    type,
+    public,
+    CAST(from_iso8601_timestamp(created_at) AS TIMESTAMP) AS event_time,
+    CAST(from_iso8601_timestamp(created_at) AS DATE)      AS event_date,
+    date_format(from_iso8601_timestamp(created_at), '%W') AS day_name,
+    hour(from_iso8601_timestamp(created_at))             AS event_hour,
+    actor.login                                          AS actor_login,
+    repo.name                                            AS repo_name,
+    COALESCE(org.login, '')                              AS org_login,
+    json_extract_scalar(payload, '$.action')             AS action,
+    json_extract_scalar(payload, '$.issue.title')        AS issue_title,
+    json_extract_scalar(payload, '$.release.tag_name')   AS release_tag,
+    CASE 
+        WHEN actor.login LIKE '%[bot]' 
+          OR actor.login LIKE '%-bot' 
+          OR actor.login LIKE '%bot-%'
+          OR actor.login IN ('dependabot', 'github-actions', 'renovate', 'codecov')
+        THEN 'Automation & Bots'
+        ELSE 'Human Developers'
+    END                                                  AS actor_type
+FROM hudi.default.github_events
+WHERE id != '15182084537';
+```
 
 ---
 

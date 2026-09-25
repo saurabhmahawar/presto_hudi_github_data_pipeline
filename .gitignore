@@ -1,0 +1,26 @@
+# Secrets and Credentials
+.env
+credentials.json
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Java / Large binaries (exclude general jars, but keep required Hive metastore JDBC driver)
+*.jar
+!metastore/lib/*.jar
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker data volumes (if exported locally)
+mysql-data/
+superset-data/

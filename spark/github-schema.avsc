@@ -1,0 +1,185 @@
+{
+  "type": "record",
+  "name": "github_events",
+  "namespace": "hudi",
+  "fields": [
+    {"name": "id", "type": ["null", "string"], "default": null},
+    {"name": "type", "type": ["null", "string"], "default": null},
+    {"name": "public", "type": ["null", "boolean"], "default": null},
+    {"name": "created_at", "type": ["null", "string"], "default": null},
+    {
+      "name": "actor",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "actor_record",
+          "fields": [
+            {"name": "id", "type": ["null", "long"], "default": null},
+            {"name": "login", "type": ["null", "string"], "default": null},
+            {"name": "display_login", "type": ["null", "string"], "default": null},
+            {"name": "gravatar_id", "type": ["null", "string"], "default": null},
+            {"name": "url", "type": ["null", "string"], "default": null},
+            {"name": "avatar_url", "type": ["null", "string"], "default": null}
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "repo",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "repo_record",
+          "fields": [
+            {"name": "id", "type": ["null", "long"], "default": null},
+            {"name": "name", "type": ["null", "string"], "default": null},
+            {"name": "url", "type": ["null", "string"], "default": null}
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "org",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "org_record",
+          "fields": [
+            {"name": "id", "type": ["null", "long"], "default": null},
+            {"name": "login", "type": ["null", "string"], "default": null},
+            {"name": "gravatar_id", "type": ["null", "string"], "default": null},
+            {"name": "url", "type": ["null", "string"], "default": null},
+            {"name": "avatar_url", "type": ["null", "string"], "default": null}
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "payload",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "payload_record",
+          "fields": [
+            {"name": "action", "type": ["null", "string"], "default": null},
+            {"name": "ref", "type": ["null", "string"], "default": null},
+            {"name": "ref_type", "type": ["null", "string"], "default": null},
+            {"name": "master_branch", "type": ["null", "string"], "default": null},
+            {"name": "description", "type": ["null", "string"], "default": null},
+            {"name": "pusher_type", "type": ["null", "string"], "default": null},
+            {"name": "push_id", "type": ["null", "long"], "default": null},
+            {"name": "head", "type": ["null", "string"], "default": null},
+            {"name": "before", "type": ["null", "string"], "default": null},
+            {"name": "number", "type": ["null", "long"], "default": null},
+            {"name": "repository_id", "type": ["null", "long"], "default": null},
+            {
+              "name": "issue",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "issue_record",
+                  "fields": [
+                    {"name": "id", "type": ["null", "long"], "default": null},
+                    {"name": "number", "type": ["null", "long"], "default": null},
+                    {"name": "title", "type": ["null", "string"], "default": null},
+                    {"name": "state", "type": ["null", "string"], "default": null},
+                    {"name": "html_url", "type": ["null", "string"], "default": null}
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "pull_request",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "pull_request_record",
+                  "fields": [
+                    {"name": "id", "type": ["null", "long"], "default": null},
+                    {"name": "number", "type": ["null", "long"], "default": null},
+                    {"name": "url", "type": ["null", "string"], "default": null},
+                    {
+                      "name": "head",
+                      "type": [
+                        "null",
+                        {
+                          "type": "record",
+                          "name": "head_record",
+                          "fields": [
+                            {"name": "ref", "type": ["null", "string"], "default": null},
+                            {"name": "sha", "type": ["null", "string"], "default": null}
+                          ]
+                        }
+                      ],
+                      "default": null
+                    },
+                    {
+                      "name": "base",
+                      "type": [
+                        "null",
+                        {
+                          "type": "record",
+                          "name": "base_record",
+                          "fields": [
+                            {"name": "ref", "type": ["null", "string"], "default": null},
+                            {"name": "sha", "type": ["null", "string"], "default": null}
+                          ]
+                        }
+                      ],
+                      "default": null
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "comment",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "comment_record",
+                  "fields": [
+                    {"name": "id", "type": ["null", "long"], "default": null},
+                    {"name": "body", "type": ["null", "string"], "default": null},
+                    {"name": "html_url", "type": ["null", "string"], "default": null}
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "release",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "release_record",
+                  "fields": [
+                    {"name": "id", "type": ["null", "long"], "default": null},
+                    {"name": "tag_name", "type": ["null", "string"], "default": null},
+                    {"name": "name", "type": ["null", "string"], "default": null},
+                    {"name": "html_url", "type": ["null", "string"], "default": null}
+                  ]
+                }
+              ],
+              "default": null
+            }
+          ]
+        }
+      ],
+      "default": null
+    }
+  ]
+}

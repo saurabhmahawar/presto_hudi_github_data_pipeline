@@ -302,12 +302,18 @@ services:
         superset init &&
         touch /app/superset_home/.initialized
       fi &&
+      if [ ! -f '/app/superset_home/.dashboard_imported' ]; then
+        (superset import-dashboards -p /app/seed/GitHub_Archive_Analytics_Dashboard.zip -u admin &&
+        touch /app/superset_home/.dashboard_imported) ||
+        echo 'WARNING: dashboard import skipped (github_events table not ready?). Run: docker compose restart superset'
+      fi &&
       exec /app/docker/entrypoints/run-server.sh
       "
     ports:
       - "8088:8088"
     volumes:
       - superset-data:/app/superset_home
+      - ./superset:/app/seed:ro
     depends_on:
       presto-server:
         condition: service_healthy

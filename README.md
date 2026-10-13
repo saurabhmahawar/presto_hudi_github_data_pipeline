@@ -426,7 +426,7 @@ You can run interactive SQL queries against the lakehouse either directly in you
 #### Option A: Apache Superset SQL Lab (Web UI — Recommended)
 
 1. Open **[http://localhost:8088](http://localhost:8088)** in your browser (`admin` / `admin`).
-2. **Connect to Presto (First-time setup):**
+2. **Connect to Presto:** the `Presto` connection is created automatically by the dashboard import on first start (see [Step 4](#4-visualize-data-in-apache-superset)). If it is missing, add it manually:
    * Navigate to **Settings** (top right) → **Database Connections** → **+ Database**.
    * Select **Presto** from the database dropdown.
    * Enter the internal Docker SQLAlchemy URI:
@@ -509,7 +509,17 @@ This interactive script executes three live demonstrations:
 
 ### 4. Visualize data in Apache Superset
 
-With the Presto database connection configured in Step 2, explore the pre-built production dashboards (persisted across container lifecycles in the `superset-data` volume):
+On first start, the `superset` container automatically imports [`superset/GitHub_Archive_Analytics_Dashboard.zip`](superset/GitHub_Archive_Analytics_Dashboard.zip), which contains the `Presto` database connection, the `github_events_flat` virtual dataset, all 15 charts and the dashboard. Everything is then persisted across container lifecycles in the `superset-data` volume.
+
+> **Note:** the import needs `hudi.default.github_events` to exist, so it only succeeds after the first Airflow ingestion (Step 1). If the container started earlier, the log shows `dashboard import skipped`. Run the DAG, then restart the container to retry the import:
+> ```bash
+> docker compose restart superset
+> ```
+> To import manually into an existing volume: `docker exec superset superset import-dashboards -p /app/seed/GitHub_Archive_Analytics_Dashboard.zip -u admin`.
+>
+> To refresh the bundled file after editing the dashboard, use **Dashboards → ⋯ → Export** and replace the zip.
+
+Explore the pre-built production dashboard:
 
 1. Open **[http://localhost:8088](http://localhost:8088)** in your browser (`admin` / `admin`).
 2. Navigate directly to the production analytics dashboard:
